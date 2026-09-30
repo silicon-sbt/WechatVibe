@@ -25,6 +25,24 @@ from backend_contracts import (
 from history_browser import encode_cursor
 
 
+# Official accounts, service notifications and fold placeholders carry no conversation
+# worth analysing, so a whole-account sidebar leaves them out.
+SERVICE_ACCOUNT_IDS = frozenset({
+    "brandsessionholder", "brandservicesessionholder", "notifymessage", "weixin",
+    "opencustomerservicemsg", "newsapp", "weixinliteservice", "weixinreminder",
+    "fmessage", "floatbottle", "medianote", "qqmail", "voiceinput", "exmail_tool",
+})
+SERVICE_ACCOUNT_SUFFIXES = frozenset({"placeholder_foldgroup", "weclaw", "kefu.openim"})
+
+
+def is_service_account(user):
+    """Official accounts and system rows are not conversations."""
+    if user.startswith("gh_"):
+        return True
+    base, _, suffix = user.partition("@")
+    return base.lower() in SERVICE_ACCOUNT_IDS or suffix.lower() in SERVICE_ACCOUNT_SUFFIXES
+
+
 def active_account_dir():
     """Resolve a unique live account from WeChat's open-file metadata, never DB mtimes."""
     native_reader = str(ROOT / "native-reader")
@@ -381,7 +399,7 @@ class WeChatSource:
                                         "ORDER BY sort_timestamp DESC,rowid DESC")
                     while batch := rows.fetchmany(256):
                         for user, unread, summary, last_time, sender, sender_name, sort_time, message_type, sub_type, is_top in batch:
-                            if not isinstance(user, str) or not user:
+                            if not isinstance(user, str) or not user or is_service_account(user):
                                 continue
                             contact = contact_display(contacts, user)
                             try:
@@ -943,6 +961,42 @@ class WeChatSource:
                     conn.close()
             return count, text_count, [{"id": member, **contact_display(contacts, member)}
                                        for member in sorted(members)]
+
+    def target_text_totals(self, users):
+        """Messages the portrait scan can consume, per conversation.
+
+        Same predicate as _analyzable_counts (plain text plus quoted replies) but without the
+        per-row classification, which is what made a whole-account inventory expensive: these
+        are plain SQL counts, milliseconds per conversation.
+        """
+        self.require_messages_ready()
+        with self.lock:
+            db = self._db()
+            own = self.self_user(db)
+            totals = {}
+            for user in users:
+                found = db._msg_conns(user)
+                total = 0
+                try:
+                    for conn, table in found:
+                        if not re.fullmatch(r"Msg_[0-9a-fA-F]{32}", table):
+                            raise RuntimeError("invalid message table")
+                        senders = {int(row[0]): row[1] for row in
+                                   conn.execute("SELECT rowid,user_name FROM Name2Id")}
+                        ids = [sender_id for sender_id, name in senders.items()
+                               if name and name != own]
+                        if not ids:
+                            continue
+                        placeholders = ",".join("?" for _ in ids)
+                        total += conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE local_type IN (?,?) "
+                            f"AND real_sender_id IN ({placeholders})",
+                            (1, QUOTED_REPLY_TYPE, *ids)).fetchone()[0]
+                finally:
+                    for conn in {id(conn): conn for conn, _ in found}.values():
+                        conn.close()
+                totals[user] = total
+            return totals
 
     def profile_metadata(self, user, member=None):
         """Read metadata once per snapshot revision; Backend brackets the account scope."""
