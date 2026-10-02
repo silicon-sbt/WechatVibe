@@ -1949,6 +1949,27 @@ function scheduleIncremental(user, token, signal, data, changed, signature) {
   state.requestedSignature = signature;
   void startIncremental(user, token, signal, key, state);
 }
+// Poll the analysis read a few times right after a label pass is requested, so a new
+// message shows its labels as soon as the cheap read has them.
+let labelFollowUpTimer = null;
+let labelFollowUpTries = 0;
+function followUpLabels(user, token, signal) {
+  clearTimeout(labelFollowUpTimer);
+  labelFollowUpTries = 0;
+  const tick = async () => {
+    labelFollowUpTimer = null;
+    if (token !== chatState.generation || user !== chatState.currentUser || chatState.historyState ||
+        document.hidden || !canAnalyzeLocal()) return;
+    if (!uncoveredMessages().length) return;
+    await loadAnalysis(user, token, signal);
+    if (token !== chatState.generation || user !== chatState.currentUser || chatState.historyState) return;
+    if (!uncoveredMessages().length) return;
+    if (++labelFollowUpTries < 10) {
+      labelFollowUpTimer = setTimeout(tick, labelFollowUpTries < 4 ? 1500 : 4000);
+    }
+  };
+  labelFollowUpTimer = setTimeout(tick, 1200);
+}
 async function loadAnalysis(user, token, signal) {
   if (chatState.historyState || !canAnalyzeLocal()) return;
   const request = ++portraitState.analysisGeneration;
@@ -2000,6 +2021,10 @@ async function analyzeRecent(user, token, signal, signature, limit, window) {
       labelState.inlineIntentJobId = data.job?.recent?.id || null;
       renderJob(data.job, false);
       await loadAnalysis(user, token, signal);
+      // The label pass runs in the background, so labels for a brand-new message only
+      // appear on a later read. Follow the window briefly instead of waiting for the
+      // next user action.
+      followUpLabels(user, token, signal);
     }
   } catch (error) {
     if (error.name !== "AbortError" && token === chatState.generation && canAnalyzeLocal()) {
@@ -4555,6 +4580,32 @@ byId("chatMessages").addEventListener("scroll", event => {
 });
 byId("btnHistoryEarlier").addEventListener("click", () => void loadOlderHistory());
 byId("btnHistoryNewer").addEventListener("click", () => void loadNewerHistory());
+let refreshBusy = false;
+async function manualRefresh() {
+  if (refreshBusy) return;
+  refreshBusy = true;
+  const button = byId("btnRefresh");
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = "刷新中…";
+  try {
+    if (!chatState.historyState && chatState.currentUser)
+      await loadMessages(chatState.generation, true, true);
+    await loadSessions();
+    if (chatState.currentUser && chatState.view === "persona") await loadProfile(portraitState.activeMember);
+    else if (chatState.currentUser)
+      await loadAnalysis(chatState.currentUser, chatState.generation, chatState.controller?.signal);
+    if (settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api" &&
+        settingsState.settings.intent) ensureApiInsights(true);
+    void loadAnalysisOverview();
+  } catch { /* the per-path status text already reports the failure */ }
+  finally {
+    button.textContent = label;
+    button.disabled = false;
+    refreshBusy = false;
+  }
+}
+byId("btnRefresh").addEventListener("click", () => { void manualRefresh(); });
 byId("btnReturnLatest").addEventListener("click", returnToLatest);
 byId("btnChatHistory").addEventListener("click", () => byId("historySearchPanel").hidden ? openHistorySearch() : closeHistorySearch());
 byId("btnCloseHistorySearch").addEventListener("click", closeHistorySearch);

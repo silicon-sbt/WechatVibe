@@ -31,6 +31,15 @@ it("renders image messages from the local bridge with a zoom and retry path", ()
   assert.ok(css.includes(".msg-image.zoomed {"));
 });
 
+it("keeps the manual refresh entry and the label follow-up wired", () => {
+  assert.ok(html.includes('id="btnRefresh"'));
+  assert.ok(html.includes('title="重新从微信读取会话列表和当前聊天"'));
+  assert.match(app, /(?:async )?function manualRefresh\(/);
+  assert.match(app, /(?:async )?function followUpLabels\(/);
+  assert.ok(app.includes('byId("btnRefresh").addEventListener("click"'));
+  assert.ok(app.includes("followUpLabels(user, token, signal)"));
+});
+
 it("keeps the self-use calls on the documented bridge endpoints", () => {
   assert.ok(app.includes('"/api/conversation-selection"'));
   assert.ok(app.includes('"/api/analysis-overview"'));
