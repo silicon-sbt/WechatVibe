@@ -57,8 +57,8 @@ function getVisibleUnreadCount(session) {
   if (hasNewTime || hasNewPreview) return serverUnread;
   return 0;
 }
-const defaults = { theme: "dark", zoom: "1.0", intent: true };
-const CURRENT_LABEL_SCHEMA = "generic-v8";
+const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: true };
+const CURRENT_LABEL_SCHEMA = "generic-v9";
 const GENERIC_INTENT_LABELS = Object.freeze({
   small_talk: "闲聊", share_news: "分享", ask_question: "提问", seek_help: "求助",
   give_comfort: "安慰", agree: "同意", invite: "邀约", show_affection: "表达好感",
@@ -91,6 +91,7 @@ delete settings.historyLimit;
 if (!["dark", "light"].includes(settings.theme)) settings.theme = "dark";
 if (!["0.9", "1.0", "1.1", "1.25", "1.5"].includes(settings.zoom)) settings.zoom = "1.0";
 if (typeof settings.intent !== "boolean") settings.intent = true;
+if (typeof settings.backgroundAnalyze !== "boolean") settings.backgroundAnalyze = true;
 const save = () => localStorage.setItem("real-ui-settings-1", JSON.stringify(settings));
 const sessions = new Map();
 const selectedConversations = new Set();
@@ -117,6 +118,10 @@ let sessionRefreshQueued = false;
 let windowRequestSerial = 0;
 let preloadDone = 0;
 let preloadTotal = 0;
+const PRELOAD_SESSION_LIMIT = 24;
+// True while the sidebar mirrors every conversation of the account, so newly
+// arrived conversations join it automatically instead of waiting for a click.
+let allConversationsTracked = false;
 let currentAccount = null;
 let currentUser = null;
 let currentHasMoreBefore = null;
@@ -691,10 +696,12 @@ function renderSessions() {
 }
 async function preloadSessionWindows(account, nextSessions, request) {
   const list = [...nextSessions.values()].filter(session => selectedConversations.has(session.username));
-  preloadTotal = list.length;
-  if (!list.length) { preloadDone = 0; return true; }
-  const missing = list.filter(session => !sessionWindowReady(account, session));
-  preloadDone = list.length - missing.length;
+  const pending = list.filter(session => !sessionWindowReady(account, session));
+  // An account can select hundreds of conversations at once; the rest load when opened.
+  const missing = pending.slice(0, PRELOAD_SESSION_LIMIT);
+  preloadTotal = list.length - pending.length + missing.length;
+  preloadDone = list.length - pending.length;
+  if (!missing.length) return true;
   if (startupActive) showStartup("messages", `正在准备聊天记录 ${preloadDone}/${preloadTotal}`);
   for (let offset = 0; offset < missing.length; offset += 64) {
     const batch = missing.slice(offset, offset + 64);
@@ -725,12 +732,152 @@ async function loadConversationSelection(account, request) {
   if (selectionLoadedAccount === account) return;
   const state = await api("/api/conversation-selection");
   if (request !== sessionRequest || accountClearedExiting) return;
-  if (state?.account !== account || !Array.isArray(state.selectedSessions) ||
-      state.selectedSessions.some(id => typeof id !== "string"))
+  if (!validConversationSelection(state, account))
     throw new Error("Invalid conversation selection response");
+  if (state.initialized === false) {
+    // First launch for this account: put every conversation into the sidebar at once.
+    try {
+      const filled = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+        expectedAccount: account, all: true,
+      }) });
+      if (request !== sessionRequest || accountClearedExiting) return;
+      if (validConversationSelection(filled, account)) state = filled;
+    } catch { /* keep the empty selection and let the user add conversations manually */ }
+  }
   selectedConversations.clear();
   for (const id of state.selectedSessions) selectedConversations.add(id);
   selectionLoadedAccount = account;
+}
+function validConversationSelection(state, account) {
+  return Boolean(state) && state.account === account && Array.isArray(state.selectedSessions) &&
+    state.selectedSessions.every(id => typeof id === "string");
+}
+async function trackNewConversations(account) {
+  if (conversationSelectionBusy || !selectionLoadedAccount || account !== currentAccount) return;
+  const missing = [...sessions.keys()].filter(id => !selectedConversations.has(id));
+  if (!missing.length) return;
+  conversationSelectionBusy = true;
+  try {
+    const state = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+      expectedAccount: account, all: true,
+    }) });
+    if (account !== currentAccount || !validConversationSelection(state, account)) return;
+    selectedConversations.clear();
+    for (const id of state.selectedSessions) selectedConversations.add(id);
+    renderSessions();
+    if (!byId("conversationManager").hidden) renderConversationManager();
+  } catch { /* retry on the next session refresh */ }
+  finally { conversationSelectionBusy = false; }
+}
+async function addAllConversations() {
+  const account = currentAccount;
+  if (!account || conversationSelectionBusy || !selectionLoadedAccount || !sessions.size) return;
+  conversationSelectionBusy = true;
+  text("conversationManagerStatus", "正在添加全部会话…");
+  renderConversationManager();
+  try {
+    const state = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+      expectedAccount: account, all: true,
+    }) });
+    if (account !== currentAccount || !validConversationSelection(state, account))
+      throw new Error("选择结果不匹配");
+    selectedConversations.clear();
+    for (const id of state.selectedSessions) selectedConversations.add(id);
+    allConversationsTracked = true;
+    renderSessions();
+    text("conversationManagerStatus", "已添加 " + selectedConversations.size + " 个会话");
+    if (!currentUser) {
+      const first = [...sessions.keys()].find(id => selectedConversations.has(id));
+      if (first) switchSession(first);
+    }
+  } catch {
+    text("conversationManagerStatus", "操作失败，请重试");
+  } finally {
+    conversationSelectionBusy = false;
+    renderConversationManager();
+  }
+}
+// Local-model sweep: keep every selected conversation queued so the Laya analysis
+// keeps accumulating on this machine without opening each chat by hand.
+let sweepBusy = false;
+// Local analysis parallelism: the bridge keeps the pool, this mirrors its settings row.
+let workerSettings = null;
+async function backgroundAnalyzeAll() {
+  if (sweepBusy || !settings.backgroundAnalyze) return;
+  if (!canAnalyzeLocal() || !messageSourceReady || historyState || !selectionLoadedAccount ||
+      suppressedLocalAccounts.has(currentAccount)) return;
+  const account = currentAccount;
+  sweepBusy = true;
+  try {
+    // The visible conversation goes first: it is the one the user is reading.
+    const order = [...sessions.keys()];
+    if (currentUser && order.includes(currentUser)) {
+      order.splice(order.indexOf(currentUser), 1);
+      order.unshift(currentUser);
+    }
+    for (const id of order) {
+      if (!settings.backgroundAnalyze || !canAnalyzeLocal() || account !== currentAccount) return;
+      if (!selectedConversations.has(id)) continue;
+      try {
+        // No per-conversation read here: the backend already knows the running job, and
+        // reading 149 conversations each round was what made the interface stutter.
+        await api("/api/analyze", { method: "POST", body: JSON.stringify({
+          account, user: id, mode: "incremental",
+        }) });
+      } catch { /* one broken conversation must not stop the sweep */ }
+    }
+  } finally {
+    sweepBusy = false;
+    void loadAnalysisOverview();
+  }
+}
+// Whole-account progress behind the sidebar bar: how many conversations have been
+// walked to the end of their history by the local background sweep.
+let overviewBusy = false;
+let analysisOverviewSnapshot = null;
+async function loadAnalysisOverview() {
+  if (overviewBusy) return;
+  overviewBusy = true;
+  try {
+    const data = await api("/api/analysis-overview");
+    if (data && typeof data.conversations === "number") {
+      analysisOverviewSnapshot = data;
+      renderAnalysisOverview(data);
+    }
+  } catch { /* keep the last shown progress */ }
+  finally { overviewBusy = false; }
+}
+function renderAnalysisOverview(data) {
+  const panel = byId("sweepProgress");
+  if (!data.conversations || !canAnalyzeLocal() || !settings.backgroundAnalyze || !messageSourceReady) {
+    panel.hidden = true;
+    return;
+  }
+  const analyzed = Math.max(0, Number(data.analyzed) || 0);
+  const total = Math.max(0, Number(data.textTotal) || 0);
+  const percent = total > 0 ? Math.min(100, 100 * analyzed / total) : 0;
+  const complete = Math.max(0, Math.min(Number(data.complete) || 0, data.conversations));
+  panel.hidden = false;
+  byId("sweepProgressFill").style.width = percent.toFixed(2) + "%";
+  byId("sweepProgressValue").textContent =
+    percent >= 10 ? Math.floor(percent) + "%" : percent.toFixed(1) + "%";
+  const running = data.running ? sessions.get(data.running) : null;
+  byId("sweepProgressLabel").textContent =
+    running ? "后台分析 · " + (running.name || data.running) : "后台分析";
+  const details = ["已分析 " + analyzed + " / " + total + " 条文本（" + percent.toFixed(1) + "%）",
+    "完成 " + complete + " / " + data.conversations + " 个会话",
+    "已开始 " + (Number(data.scanned) || 0) + " 个"];
+  const workers = data.workers;
+  if (workers && Number(workers.max) > 1) {
+    details.push(workers.elastic ? "并行档位 " + workers.limit + " / " + workers.max + "（随负载自动调整）"
+      : "并行 " + workers.limit + " 路");
+  }
+  if (workers && typeof workers.gpu === "number") details.push("GPU " + Math.round(workers.gpu) + "%");
+  if (workers && typeof workers.gpuFreeMiB === "number") {
+    details.push("可用显存 " + (workers.gpuFreeMiB / 1024).toFixed(1) + " GB");
+  }
+  if (workers && typeof workers.cpu === "number") details.push("CPU " + Math.round(workers.cpu) + "%");
+  panel.title = details.join(" · ");
 }
 function clearUnselectedConversation() {
   if (currentUser) {
@@ -822,10 +969,14 @@ async function toggleConversationSelected(user) {
       if (!currentUser) switchSession(user);
       else void preloadSessionWindows(account, new Map([[user, sessions.get(user)]]), sessionRequest)
         .catch(() => text("conversationManagerStatus", "已添加，消息将在点开会话时读取"));
-    } else if (!selected && currentUser === user) {
-      const next = [...sessions.keys()].find(id => selectedConversations.has(id));
-      if (next) switchSession(next);
-      else clearUnselectedConversation();
+    } else if (!selected) {
+      // An explicit removal ends whole-account tracking until it is asked for again.
+      allConversationsTracked = false;
+      if (currentUser === user) {
+        const next = [...sessions.keys()].find(id => selectedConversations.has(id));
+        if (next) switchSession(next);
+        else clearUnselectedConversation();
+      }
     }
     text("conversationManagerStatus", selected ? "已添加" : "已从列表移除");
   } catch {
@@ -923,6 +1074,9 @@ async function loadSessions(retryChanged = true) {
     renderSessions();
     if (!byId("conversationManager").hidden) renderConversationManager();
     byId("sessionList").scrollTop = scroll;
+    if (!allConversationsTracked && sessions.size &&
+        [...sessions.keys()].every(id => selectedConversations.has(id))) allConversationsTracked = true;
+    if (allConversationsTracked) void trackNewConversations(data.account);
     if (!await preloadSessionWindows(data.account, nextSessions, request)) return;
     if (request !== sessionRequest || currentAccount !== data.account) return;
     let remembered = null;
@@ -1139,6 +1293,9 @@ function updateLabel(message, node) {
     wrap.appendChild(row);
   }
 }
+// One hint per session: the bridge derives the image key the first time it is asked for a
+// picture, and that scan only succeeds while WeChat itself is showing an image.
+let imageKeyHintShown = false;
 function messageNode(message) {
   const session = sessions.get(currentUser);
   const item = element("div", `msg-item ${message.side === "self" ? "outgoing" : "incoming"}`);
@@ -1148,8 +1305,40 @@ function messageNode(message) {
   item.appendChild(avatarColumn);
   const wrap = element("div", "msg-content-wrap");
   if (session?.isGroup && message.side !== "self") wrap.appendChild(element("span", "msg-sender", message.senderName || message.senderId || "未知成员"));
-  wrap.appendChild(element("div", "msg-bubble", message.kind === "image" ? "[图片]" :
-    message.kind === "text" ? message.text || "" : message.text || "[不支持的消息]"));
+  if (message.kind === "image") {
+    // Images are decrypted on demand by the local bridge, so the bubble shows the picture
+    // itself and only falls back to the placeholder when it cannot be read.
+    const image = document.createElement("img");
+    image.className = "msg-image";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.alt = "图片";
+    image.src = "/api/media?user=" + encodeURIComponent(currentUser) +
+      "&id=" + encodeURIComponent(message.id);
+    image.addEventListener("click", () => image.classList.toggle("zoomed"));
+    // The bridge may still be deriving the image key, so retry a few times before the
+    // placeholder takes over.
+    let attempts = 0;
+    image.addEventListener("error", () => {
+      if (++attempts <= 6) {
+        setTimeout(() => {
+          const base = "/api/media?user=" + encodeURIComponent(currentUser) +
+            "&id=" + encodeURIComponent(message.id);
+          image.src = base + "&retry=" + attempts;
+        }, 20000);
+        return;
+      }
+      image.replaceWith(element("div", "msg-bubble", "[图片]"));
+      if (!imageKeyHintShown) {
+        imageKeyHintShown = true;
+        toast("首次显示图片需要在微信里点开任意一张图片（用于获取解密密钥），之后会自动显示");
+      }
+    });
+    wrap.appendChild(image);
+  } else {
+    wrap.appendChild(element("div", "msg-bubble",
+      message.kind === "text" ? message.text || "" : message.text || "[不支持的消息]"));
+  }
   item.appendChild(wrap);
   updateLabel(message, item);
   return item;
@@ -1683,6 +1872,28 @@ function scheduleIncremental(user, token, signal, data, changed, signature) {
   state.requestedSignature = signature;
   void startIncremental(user, token, signal, key, state);
 }
+// Poll the analysis read a few times right after a label pass is requested, so a newly
+// arrived message shows its labels as soon as the cheap read has them.
+let labelFollowUpTimer = null;
+let labelFollowUpTries = 0;
+function followUpLabels(user, token, signal) {
+  clearTimeout(labelFollowUpTimer);
+  labelFollowUpTries = 0;
+  const tick = async () => {
+    labelFollowUpTimer = null;
+    if (token !== generation || user !== currentUser || historyState || document.hidden ||
+        !canAnalyzeLocal()) return;
+    if (!uncoveredMessages().length) return;
+    await loadAnalysis(user, token, signal);
+    if (token !== generation || user !== currentUser || historyState) return;
+    if (!uncoveredMessages().length) return;
+    if (++labelFollowUpTries < 10) {
+      labelFollowUpTimer = setTimeout(tick, labelFollowUpTries < 4 ? 1500 : 4000);
+    }
+  };
+  labelFollowUpTimer = setTimeout(tick, 1200);
+}
+
 async function loadAnalysis(user, token, signal) {
   if (historyState || !canAnalyzeLocal()) return;
   const request = ++analysisGeneration;
@@ -1727,6 +1938,11 @@ async function analyzeRecent(user, token, signal, signature, limit, window) {
     const data = await api("/api/analyze", { method: "POST", body: JSON.stringify({
       account, user, mode: "recent", limit,
     }) }, signal);
+    // The chat on screen is what the user is looking at: walk its history now instead of
+    // waiting for the next background round. The backend gives the visible key priority.
+    void api("/api/analyze", { method: "POST", body: JSON.stringify({
+      account, user, mode: "incremental",
+    }) }).catch(() => {});
     if (token === generation && canAnalyzeLocal()) {
       recentNetworkFailed = false;
       if (manualRecentAwaitingPost) manualRecentJobId = data.job?.recent?.id || null;
@@ -1734,6 +1950,10 @@ async function analyzeRecent(user, token, signal, signature, limit, window) {
       inlineIntentJobId = data.job?.recent?.id || null;
       renderJob(data.job, false);
       await loadAnalysis(user, token, signal);
+      // The label pass runs in the background, so labels for a brand-new message only
+      // appear on a later read. Follow the window briefly instead of waiting for the
+      // next user action.
+      followUpLabels(user, token, signal);
     }
   } catch (error) {
     if (error.name !== "AbortError" && token === generation && canAnalyzeLocal()) {
@@ -1829,6 +2049,8 @@ function switchSession(user, force = false) {
   clearInlineIntentPending();
   clearTimeout(selectedAnalysisTimer);
   selectedAnalysisTimer = null;
+  clearTimeout(labelFollowUpTimer);
+  labelFollowUpTimer = null;
   cancelHistoryRequest();
   historyState = null;
   resetHistorySearch();
@@ -2969,6 +3191,10 @@ function applySettings() {
   byId("selectZoomLevel").value = settings.zoom;
   byId("btnToggleIntent").classList.toggle("active", settings.intent);
   byId("btnToggleIntent").setAttribute("aria-pressed", String(settings.intent));
+  byId("btnToggleBackgroundAnalyze").classList.toggle("active", settings.backgroundAnalyze);
+  byId("btnToggleBackgroundAnalyze").setAttribute("aria-pressed", String(settings.backgroundAnalyze));
+  byId("btnToggleBackgroundAnalyze").textContent = settings.backgroundAnalyze ? "已开启" : "已关闭";
+  if (analysisOverviewSnapshot) renderAnalysisOverview(analysisOverviewSnapshot);
   refreshLabels();
 }
 let runtimeSnapshot = null;
@@ -4202,6 +4428,31 @@ byId("btnHistoryEarlier").addEventListener("click", () => void loadOlderHistory(
 byId("btnHistoryNewer").addEventListener("click", () => void loadNewerHistory());
 byId("btnReturnLatest").addEventListener("click", returnToLatest);
 byId("btnChatHistory").addEventListener("click", () => byId("historySearchPanel").hidden ? openHistorySearch() : closeHistorySearch());
+// Manual refresh: re-read the session list and the open conversation from WeChat now,
+// instead of waiting for the 4 s / 15 s auto-refresh timers.
+let refreshBusy = false;
+async function manualRefresh() {
+  if (refreshBusy) return;
+  refreshBusy = true;
+  const button = byId("btnRefresh");
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = "刷新中…";
+  try {
+    if (!historyState && currentUser) await loadMessages(generation, true, true);
+    await loadSessions();
+    if (currentUser && view === "persona") await loadProfile(activeMember);
+    else if (currentUser) await loadAnalysis(currentUser, generation, controller?.signal);
+    if (modelSourceResolved && modelSourceSnapshot.mode === "api" && settings.intent) ensureApiInsights(true);
+    void loadAnalysisOverview();
+  } catch { /* the per-path status text already reports the failure */ }
+  finally {
+    button.textContent = label;
+    button.disabled = false;
+    refreshBusy = false;
+  }
+}
+byId("btnRefresh").addEventListener("click", () => { void manualRefresh(); });
 byId("btnCloseHistorySearch").addEventListener("click", closeHistorySearch);
 byId("historySearchForm").addEventListener("submit", event => { event.preventDefault(); startHistorySearch(); });
 byId("btnCancelHistorySearch").addEventListener("click", () => cancelHistorySearch(true));
@@ -4273,6 +4524,60 @@ byId("btnToggleIntent").addEventListener("click", () => {
     if (modelSourceSnapshot.mode === "api") ensureApiInsights(true);
     else submitManualRecent();
   }
+});
+byId("btnToggleBackgroundAnalyze").addEventListener("click", () => {
+  settings.backgroundAnalyze = !settings.backgroundAnalyze;
+  save();
+  applySettings();
+  if (settings.backgroundAnalyze) void backgroundAnalyzeAll();
+});
+async function loadWorkerSettings() {
+  try {
+    workerSettings = await api("/api/analysis-workers");
+  } catch {
+    workerSettings = null;
+  }
+  renderWorkerSettings();
+}
+function renderWorkerSettings() {
+  const hint = byId("workerLimitHint");
+  const row = hint.parentElement;
+  if (!workerSettings) {
+    byId("workerLimitValue").textContent = "—";
+    row.classList.remove("show");
+    return;
+  }
+  byId("workerLimitValue").textContent = String(workerSettings.workers);
+  byId("btnWorkerMinus").disabled = workerSettings.workers <= 1;
+  byId("btnWorkerPlus").disabled = workerSettings.workers >= (workerSettings.max || 4);
+  const elastic = byId("btnToggleElasticWorkers");
+  elastic.textContent = workerSettings.elastic ? "跟随负载" : "固定档位";
+  elastic.classList.toggle("active", !!workerSettings.elastic);
+  elastic.setAttribute("aria-pressed", String(!!workerSettings.elastic));
+  row.classList.add("show");
+  const live = workerSettings.elastic && Number(workerSettings.max) > 1
+    ? "当前 " + workerSettings.limit + " / " + workerSettings.workers + " 路（负载高时自动降档）"
+    : "固定 " + workerSettings.workers + " 路并行";
+  hint.textContent = (Number(workerSettings.workers) > 1
+    ? "越多越快、也越占 CPU 和显存；" : "单路最省资源；") + live + "。";
+}
+async function changeWorkerSettings(delta, elastic) {
+  if (!workerSettings) return;
+  const max = workerSettings.max || 4;
+  const workers = Math.max(1, Math.min(max, (Number(workerSettings.workers) || 1) + delta));
+  try {
+    workerSettings = await api("/api/analysis-workers", { method: "POST", body: JSON.stringify({
+      workers, elastic: elastic === undefined ? !!workerSettings.elastic : elastic,
+    }) });
+  } catch {
+    return;
+  }
+  renderWorkerSettings();
+}
+byId("btnWorkerMinus").addEventListener("click", () => { void changeWorkerSettings(-1); });
+byId("btnWorkerPlus").addEventListener("click", () => { void changeWorkerSettings(1); });
+byId("btnToggleElasticWorkers").addEventListener("click", () => {
+  void changeWorkerSettings(0, !workerSettings?.elastic);
 });
 for (const [id, key] of [["selectThemeMode", "theme"], ["selectZoomLevel", "zoom"]]) byId(id).addEventListener("change", event => { settings[key] = event.target.value; save(); applySettings(); });
 byId("selectRuntimeProvider").addEventListener("change", event => { void changeRuntime(event.target.value); });
@@ -4546,6 +4851,7 @@ byId("btnManageConversations").addEventListener("click", () => {
   }
 });
 byId("conversationSearch").addEventListener("input", renderConversationManager);
+byId("btnAddAllConversations").addEventListener("click", () => { void addAllConversations(); });
 byId("btnCloseSettings").addEventListener("click", closeSettingsModal);
 byId("settingsModal").addEventListener("click", event => { if (event.target === byId("settingsModal")) closeSettingsModal(); });
 byId("btnManageAccounts").addEventListener("click", () => {
@@ -4743,6 +5049,11 @@ window.addEventListener("wechatvibe-service-restored", () => {
 if (!updateValidationMode) {
   setInterval(() => { if (updateCommitReady && currentUser && !document.hidden) loadMessages(generation, true); }, 4000);
   setInterval(() => { if (updateCommitReady && !document.hidden) loadSessions(); }, 15000);
+  setTimeout(() => { if (updateCommitReady) void backgroundAnalyzeAll(); }, 20000);
+  setInterval(() => { if (updateCommitReady) void backgroundAnalyzeAll(); }, 600000);
+  setTimeout(() => { if (updateCommitReady) void loadAnalysisOverview(); }, 8000);
+  setInterval(() => { if (updateCommitReady && !document.hidden) void loadAnalysisOverview(); }, 60000);
+  setTimeout(() => { if (updateCommitReady) void loadWorkerSettings(); }, 9000);
 }
 document.addEventListener("visibilitychange", () => {
   if (document.hidden || updateValidationMode || !updateCommitReady) return;

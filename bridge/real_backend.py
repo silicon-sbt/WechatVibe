@@ -172,13 +172,85 @@ MBTI_SOURCES = [
     "https://www.themyersbriggs.com/en-US/Products-and-Services/Myers-Briggs",
 ]
 SYSTEM_NAMES = {"filehelper": "文件传输助手", "newsapp": "腾讯新闻", "brandsessionholder": "公众号消息"}
+# Official accounts, service notifications and fold placeholders carry no conversation
+# worth analysing, so a whole-account sidebar leaves them out.
+SERVICE_ACCOUNT_IDS = frozenset({
+    "brandsessionholder", "brandservicesessionholder", "notifymessage", "weixin",
+    "opencustomerservicemsg", "newsapp", "weixinliteservice", "weixinreminder",
+    "fmessage", "floatbottle", "medianote", "qqmail", "voiceinput", "exmail_tool",
+})
+SERVICE_ACCOUNT_SUFFIXES = frozenset({"placeholder_foldgroup", "weclaw", "kefu.openim"})
+
+
+def is_service_account(user):
+    """Official accounts and system rows are not conversations."""
+    if user.startswith("gh_"):
+        return True
+    base, _, suffix = user.partition("@")
+    return base.lower() in SERVICE_ACCOUNT_IDS or suffix.lower() in SERVICE_ACCOUNT_SUFFIXES
 MAX_ISSUED_IMAGES = 2048
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 FORECAST_CACHE_LIMIT = 64
 FORECAST_SOURCE_WINDOW = 16
 PROFILE_METADATA_CACHE_LIMIT = 64
+DEFAULT_ANALYSIS_WORKERS = 3
+MAX_ANALYSIS_WORKERS = 4
+
+
+# How far the backwards pass walks before the forward scan takes over.
+BACKLOG_MAX_OFFSET = 4000
+BACKLOG_PAGE = 200
+
+ELASTIC_SAMPLE_SECONDS = 30
+ELASTIC_RAMP_SAMPLES = 2
+ELASTIC_BUSY_CPU = 80
+ELASTIC_BUSY_MEMORY = 88
+ELASTIC_BUSY_GPU = 85
+ELASTIC_BUSY_FREE_VRAM_MIB = 2048
+ELASTIC_STOP_FREE_VRAM_MIB = 1024
+ELASTIC_CALM_CPU = 50
+ELASTIC_CALM_MEMORY = 80
+ELASTIC_CALM_GPU = 55
+ELASTIC_CALM_FREE_VRAM_MIB = 3072
+
+
+def save_worker_settings(workers, elastic):
+    """Persist the local parallelism choice next to the other runtime state."""
+    path = ROOT / ".local" / "real-client-runtime" / "analysis-workers.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"workers": int(workers), "elastic": bool(elastic)},
+                                   ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def analysis_worker_settings():
+    """Configured local worker ceiling and whether the count follows machine load.
+
+    Read from `.local/real-client-runtime/analysis-workers.json` (`{"workers": N,
+    "elastic": true}`) and overridable with `WECHATVIBE_ANALYSIS_WORKERS`.
+    """
+    workers = os.environ.get("WECHATVIBE_ANALYSIS_WORKERS")
+    elastic = None
+    if workers is None:
+        try:
+            data = json.loads((ROOT / ".local" / "real-client-runtime" /
+                               "analysis-workers.json").read_text(encoding="utf-8"))
+            workers = data.get("workers")
+            elastic = data.get("elastic")
+        except (OSError, ValueError, AttributeError):
+            workers = None
+    try:
+        count = int(workers)
+    except (TypeError, ValueError):
+        count = DEFAULT_ANALYSIS_WORKERS
+    return {"workers": count if 1 <= count <= MAX_ANALYSIS_WORKERS else DEFAULT_ANALYSIS_WORKERS,
+            "elastic": True if elastic is None else bool(elastic)}
 API_JOB_CACHE_LIMIT = 256
-FINE_LABEL_SCHEMA = "generic-v8"
+# Must equal GENERAL_LABEL_SCHEMA in electron/laya/general-intent.ts; the analysis server
+# reports it back with every answer and the bridge rejects a mismatch.
+FINE_LABEL_SCHEMA = "generic-v9"
 GROUNDED_INTENT_EVIDENCE = {
     "greet": {"greeting_phrase"}, "thank": {"thanks_phrase"},
     "confirm": {"short_acknowledgement"}, "inspect": {"first_person_inspection"},
@@ -426,6 +498,10 @@ class WeChatSource:
         self._self_username = None
         self.issued_images = OrderedDict()
         self.window_images = {}
+        # The image AES key is not one of the database keys we hold, so it is derived once
+        # by a background scan and then cached on disk by the reader.
+        self.image_key_lock = threading.Lock()
+        self.image_key_scan = {"running": False, "retry_at": 0.0}
         self.profile_metadata_cache = OrderedDict()
         self.profile_overview_counts_cache = OrderedDict()
         self.media_reason = threading.local()
@@ -692,7 +768,7 @@ class WeChatSource:
                                         "ORDER BY sort_timestamp DESC,rowid DESC")
                     while batch := rows.fetchmany(256):
                         for user, unread, summary, last_time, sender, sender_name, sort_time, message_type, sub_type, is_top in batch:
-                            if not isinstance(user, str) or not user:
+                            if not isinstance(user, str) or not user or is_service_account(user):
                                 continue
                             contact = contact_display(contacts, user)
                             try:
@@ -945,6 +1021,42 @@ class WeChatSource:
                 raise AccountChangedError()
             return texts
 
+    def _start_image_key_scan(self, db):
+        """Derive the image AES key once, off the request path.
+
+        The reader holds the database keys only; the image key is either derived from the
+        WeChat config dword or scanned out of Weixin.exe, which can take a minute. The scan
+        runs in the background and persists its result, so later reads are immediate.
+        """
+        now = time.monotonic()
+        with self.image_key_lock:
+            if self.image_key_scan["running"] or now < self.image_key_scan["retry_at"]:
+                return self.image_key_scan["running"]
+            self.image_key_scan["running"] = True
+
+        def worker():
+            found = None
+            try:
+                from wechatauto.media import MediaDownloader
+                downloader = MediaDownloader(db)
+                # A short, bounded scan: the reader's own default keeps reading Weixin.exe
+                # for 120 seconds, which is heavy enough to make the desktop client stutter.
+                key = downloader._scan_aes_key(monitor=True, monitor_timeout=20)
+                if key:
+                    downloader._persist_key(key)
+                    found = (key, downloader._xor_key)
+            except Exception:
+                found = None
+            finally:
+                with self.image_key_lock:
+                    self.image_key_scan["running"] = False
+                    if not found:
+                        # Retry later: WeChat may have been restarted since the last attempt.
+                        self.image_key_scan["retry_at"] = time.monotonic() + 600
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
     def media(self, user, stable_id):
         self.require_messages_ready()
         self.media_reason.value = None
@@ -1016,6 +1128,8 @@ class WeChatSource:
                 else:
                     aes_key = downloader._load_persisted_key()
                     if not aes_key:
+                        if self._start_image_key_scan(db):
+                            return unavailable("local-key-pending")
                         return unavailable("local-key-unavailable")
                     xor_key = downloader._derive_xor_key(dat_path)
             data = downloader.decrypt_image(dat_path, aes_key=aes_key, xor_key=xor_key)
@@ -1254,6 +1368,42 @@ class WeChatSource:
                     conn.close()
             return count, text_count, [{"id": member, **contact_display(contacts, member)}
                                        for member in sorted(members)]
+
+    def target_text_totals(self, users):
+        """Messages the portrait scan can consume, per conversation.
+
+        Same predicate as _analyzable_counts (plain text plus quoted replies) but without the
+        per-row classification, which is what made a whole-account inventory expensive: these
+        are plain SQL counts, milliseconds per conversation.
+        """
+        self.require_messages_ready()
+        with self.lock:
+            db = self._db()
+            own = self.self_user(db)
+            totals = {}
+            for user in users:
+                found = db._msg_conns(user)
+                total = 0
+                try:
+                    for conn, table in found:
+                        if not re.fullmatch(r"Msg_[0-9a-fA-F]{32}", table):
+                            raise RuntimeError("invalid message table")
+                        senders = {int(row[0]): row[1] for row in
+                                   conn.execute("SELECT rowid,user_name FROM Name2Id")}
+                        ids = [sender_id for sender_id, name in senders.items()
+                               if name and name != own]
+                        if not ids:
+                            continue
+                        placeholders = ",".join("?" for _ in ids)
+                        total += conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE local_type IN (?,?) "
+                            f"AND real_sender_id IN ({placeholders})",
+                            (1, QUOTED_REPLY_TYPE, *ids)).fetchone()[0]
+                finally:
+                    for conn in {id(conn): conn for conn, _ in found}.values():
+                        conn.close()
+                totals[user] = total
+            return totals
 
     def profile_metadata(self, user, member=None):
         """Read metadata once per snapshot revision; Backend brackets the account scope."""
@@ -1803,6 +1953,12 @@ class ResultStore:
         self.path = path
         self.profile_lock = threading.RLock()
         with self.connect() as conn:
+            # Several analysis workers write this file; WAL keeps one worker's commit
+            # from blocking another worker's read for the whole transaction.
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.DatabaseError:
+                pass
             # Serialize first-time schema creation and nullable-column migration.
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("CREATE TABLE IF NOT EXISTS results_v2 (account TEXT NOT NULL, session TEXT NOT NULL, id TEXT NOT NULL, "
@@ -2462,7 +2618,31 @@ class Backend:
     def __init__(self, source, analyzer=None, store_factory=None, model_source_store=None,
                  selection_store=None):
         self.source = source
-        self.analyzer = analyzer or NodeAnalysis()
+        # One local model process per analysis worker; threads resolve their own through
+        # the analyzer property, so several conversations can be inferred in parallel.
+        self._analyzer_ctx = threading.local()
+        worker_settings = ({"workers": 1, "elastic": False} if analyzer is not None
+                           else analysis_worker_settings())
+        self.worker_count = worker_settings["workers"]
+        self.elastic_workers = worker_settings["elastic"] and self.worker_count > 1
+        # The elastic limit decides how many workers may run; the rest park and give their
+        # model back so games and other apps keep the GPU to themselves.
+        self.worker_limit = 1 if self.elastic_workers else self.worker_count
+        self.load_condition = threading.Condition()
+        self.load_sample = {"cpu": None, "ownCpu": None, "otherCpu": None,
+                            "memory": None, "gpu": None, "gpuFreeMiB": None}
+        self.load_streak = {"up": 0, "down": 0}
+        self.load_own_seconds = None
+        try:
+            import psutil
+            self.load_cores = psutil.cpu_count() or 1
+        except Exception:
+            self.load_cores = 1
+        self.worker_busy = set()
+        self.load_monitor_thread = None
+        self._analyzers = ([analyzer] if analyzer is not None else
+                           [NodeAnalysis() for _ in range(self.worker_count)])
+        self.key_locks = {}
         self.api_analyzer = NodeAnalysis(api_only=True) if analyzer is None else analyzer
         # Long portrait generations must not hold up interactive message labels.
         self.api_portrait_analyzer = NodeAnalysis(api_only=True) if analyzer is None else analyzer
@@ -2500,6 +2680,7 @@ class Backend:
         self.selection_store = selection_store or ConversationSelectionStore(
             ROOT / ".local" / "real-client-data")
         self.stores = {}
+        self.text_totals = {}
         self.jobs = {}
         self.jobs_lock = threading.Lock()
         self.request_condition = threading.Condition()
@@ -2513,6 +2694,8 @@ class Backend:
         self.incremental_recheck = set()
         self.history_iterators = {}
         self.history_iterator_modes = {}
+        self.backlog_iterators = {}
+        self.backlog_iterator_offsets = {}
         self.quoted_backfill_iterators = {}
         self.forecast_cache = OrderedDict()
         self.forecast_lock = threading.Lock()
@@ -2524,8 +2707,41 @@ class Backend:
         if callable(getattr(self.analyzer, "analyze_batch", None)):
             from batch_engine import BatchEngine
             self.batch_engine = BatchEngine(self)
-        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self.worker_thread.start()
+        self._start_workers()
+
+    @property
+    def analyzer(self):
+        """The local model worker bound to this thread, else the primary one."""
+        return getattr(self._analyzer_ctx, "analyzer", None) or self._analyzers[0]
+
+    def _start_workers(self):
+        self.workers = [threading.Thread(target=self._worker, args=(index,), daemon=True)
+                        for index in range(len(self._analyzers))]
+        for worker in self.workers:
+            worker.start()
+        self.worker_thread = self.workers[0]
+        if self.elastic_workers and self.load_monitor_thread is None:
+            self.load_monitor_thread = threading.Thread(target=self._load_monitor, daemon=True)
+            self.load_monitor_thread.start()
+
+    def _stop_workers(self):
+        with self.load_condition:
+            self.load_condition.notify_all()
+        for _ in self.workers:
+            self.tasks.put((99, next(self.task_serial), None))
+        for worker in self.workers:
+            worker.join(timeout=200)
+        if any(worker.is_alive() for worker in self.workers):
+            raise RuntimeError("bridge worker did not stop")
+
+    def _key_lock(self, key):
+        """One conversation is driven by one worker at a time; others run in parallel."""
+        with self.jobs_lock:
+            lock = self.key_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self.key_locks[key] = lock
+            return lock
 
     @contextmanager
     def request_lease(self):
@@ -2553,13 +2769,10 @@ class Backend:
             self._cancel_api_source_work_locked()
             if not self.api_condition.wait_for(lambda: self.api_inflight == 0, timeout=200):
                 raise RuntimeError("API insight requests did not finish")
-        self.tasks.put((99, next(self.task_serial), None))
+        self._stop_workers()
         with self.request_condition:
             if not self.request_condition.wait_for(lambda: self.active_requests == 0, timeout=200):
                 raise RuntimeError("bridge requests did not finish")
-        self.worker_thread.join(timeout=200)
-        if self.worker_thread.is_alive():
-            raise RuntimeError("bridge worker did not stop")
         self.account_clear_paused = True
         try:
             forget = getattr(self.source, "forget_account", None)
@@ -2599,8 +2812,7 @@ class Backend:
         if self.batch_engine:
             from batch_engine import BatchEngine
             self.batch_engine = BatchEngine(self)
-        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self.worker_thread.start()
+        self._start_workers()
         with self.request_condition:
             self.account_clear_paused = False
             self.closing = False
@@ -2625,16 +2837,14 @@ class Backend:
             if callable(close_source):
                 close_source()
             if first:
-                self.tasks.put((99, next(self.task_serial), None))
+                self._stop_workers()
         with self.request_condition:
             if not self.request_condition.wait_for(lambda: self.active_requests == 0, timeout=200):
                 raise RuntimeError("bridge requests did not finish")
-        self.worker_thread.join(timeout=200)
-        if self.worker_thread.is_alive():
-            raise RuntimeError("bridge worker did not stop")
-        close_model = getattr(self.analyzer, "close", None)
-        if callable(close_model):
-            close_model()
+        for local in self._analyzers:
+            close_model = getattr(local, "close", None)
+            if callable(close_model):
+                close_model()
         if self.api_analyzer is not self.analyzer:
             close_api = getattr(self.api_analyzer, "close", None)
             if callable(close_api):
@@ -2731,6 +2941,24 @@ class Backend:
             raise AccountChangedError()
         return state
 
+    def set_conversation_all_selected(self, expected_account):
+        """Put every conversation of the current WeChat account into the sidebar at once."""
+        if not isinstance(expected_account, str) or not expected_account:
+            raise ValueError("invalid expected account")
+        account = self._selection_account()
+        if account != expected_account:
+            raise AccountChangedError()
+        metadata = self.source.sessions()
+        if metadata.get("account") != account:
+            raise AccountChangedError()
+        sessions = [item.get("username") for item in metadata.get("sessions", [])]
+        if self._selection_account() != account:
+            raise AccountChangedError()
+        state = self.selection_store.set_all_selected(account, sessions)
+        if self._selection_account() != account:
+            raise AccountChangedError()
+        return state
+
     def _scoped_identity(self):
         if self.closing:
             raise AccountUnavailableError()
@@ -2806,13 +3034,19 @@ class Backend:
         return self.analyzer.runtime_status()
 
     def configure_runtime(self, provider):
-        return self.analyzer.configure_runtime(provider)
+        result = None
+        for local in self._analyzers:
+            result = local.configure_runtime(provider)
+        return result
 
     def local_model_status(self):
         return self.analyzer.local_model_status()
 
     def configure_local_model(self, value):
-        return self.analyzer.configure_local_model(value)
+        result = None
+        for local in self._analyzers:
+            result = local.configure_local_model(value)
+        return result
 
     def model_source(self):
         with self.api_lock:
@@ -3432,6 +3666,108 @@ class Backend:
                     current["protocol"] = self.active_api_config["protocol"]
         self._assert_scope((account, workdir))
         return {"account": account, "sources": sources}
+
+    def analysis_performance(self):
+        """Read-only timing breakdown of local analysis, for tuning and support."""
+        account, _workdir, _store = self._scoped_identity()
+        with self.jobs_lock:
+            rows = list(self.performance.values())
+        totals = {}
+        for metrics in rows:
+            for name, value in metrics.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    totals[name] = totals.get(name, 0) + value
+        totals["conversations"] = len(rows)
+        return {"account": account, "totals": totals}
+
+    def worker_status(self):
+        """Current local parallelism, for the settings row and the progress tooltip."""
+        with self.load_condition:
+            return {"workers": self.worker_count, "max": MAX_ANALYSIS_WORKERS,
+                    "elastic": self.elastic_workers, "limit": self.worker_limit,
+                    "active": sum(1 for index in self.worker_busy), **self.load_sample}
+
+    def set_worker_settings(self, workers=None, elastic=None):
+        """Resize the local worker pool and remember the choice for the next launch."""
+        with self.load_condition:
+            count = (self.worker_count if workers is None else
+                     max(1, min(MAX_ANALYSIS_WORKERS, int(workers))))
+            if elastic is not None:
+                self.elastic_workers = bool(elastic) and count > 1
+            self.worker_count = count
+            if self.workers:
+                for index in range(len(self._analyzers), count):
+                    self._analyzers.append(NodeAnalysis())
+                    thread = threading.Thread(target=self._worker, args=(index,), daemon=True)
+                    self.workers.append(thread)
+                    thread.start()
+            self.worker_limit = (max(1, min(self.worker_limit, count)) if self.elastic_workers
+                                 else count)
+            self.load_condition.notify_all()
+        for index in range(count, len(self._analyzers)):
+            if index not in self.worker_busy:
+                self._release_worker(index)
+        save_worker_settings(count, self.elastic_workers)
+        if self.elastic_workers and self.load_monitor_thread is None and self.workers:
+            self.load_monitor_thread = threading.Thread(target=self._load_monitor, daemon=True)
+            self.load_monitor_thread.start()
+        return self.worker_status()
+
+    def analysis_overview(self):
+        """Cheap whole-account tally behind the background-analysis progress bar."""
+        account, workdir, store = self._scoped_identity()
+        version = self.analyzer.analysis_version()
+        metadata = self.source.sessions()
+        if metadata.get("account") != account:
+            raise AccountChangedError()
+        selected = set(self.selection_store.get(account)["selectedSessions"])
+        users = [item["username"] for item in metadata.get("sessions", [])
+                 if item.get("username") in selected]
+        known = set(users)
+        with store.connect() as conn:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "batch_progress_v1" in tables:
+                rows = conn.execute("SELECT session,subject,complete,state_json FROM batch_progress_v1 "
+                                    "WHERE account=? AND base_version=?",
+                                    (account, version)).fetchall()
+            else:
+                rows = [(row[0], row[0], row[1], None) for row in conn.execute(
+                    "SELECT session,complete FROM progress_v1 WHERE account=? AND version=?",
+                    (account, version))]
+        scanned = complete = analyzed = 0
+        for session, subject, done, state in rows:
+            # One row per analysed subject: the conversation itself, or "" for a group overall.
+            if session not in known or subject != ("" if session.endswith("@chatroom") else session):
+                continue
+            scanned += 1
+            complete += 1 if done else 0
+            try:
+                analyzed += int(json.loads(state or "{}").get("count") or 0)
+            except (TypeError, ValueError):
+                pass
+        # Text totals are plain SQL counts, so this stays cheap; cache them briefly because
+        # only new messages change the answer.
+        cached = self.text_totals.get(account)
+        now = time.monotonic()
+        if cached is None or now - cached[0] > 300:
+            cached = (now, self.source.target_text_totals(users))
+            self.text_totals[account] = cached
+        totals = cached[1]
+        text_total = sum(totals.get(user, 0) for user in users)
+        running = None
+        with self.jobs_lock:
+            for key, job in self.jobs.items():
+                if key[0] == account and job["status"] in ("queued", "running"):
+                    running = key[2]
+                    break
+        self._assert_scope((account, workdir))
+        with self.load_condition:
+            workers = {"limit": self.worker_limit, "max": self.worker_count,
+                       "elastic": self.elastic_workers, **self.load_sample}
+        return {"account": account, "version": version, "conversations": len(users),
+                "scanned": scanned, "complete": complete, "analyzed": analyzed,
+                "textTotal": text_total, "running": running, "workers": workers}
 
     def analysis_cache_clear(self, requested_account, source_id):
         account, workdir, store = self._scoped_identity()
@@ -4150,7 +4486,7 @@ class Backend:
         job["recent"] = {"id": uuid.uuid4().hex, "status": "queued", "total": 0, "processed": 0}
         self._enqueue((key, "recent-window", limit, store, job, scope), interactive=True)
 
-    def start(self, user, mode, limit, expected_account=None):
+    def start(self, user, mode, limit, expected_account=None, offset=0):
         account, workdir, store = self._scoped_identity()
         if expected_account is not None and account != expected_account:
             raise AccountChangedError()
@@ -4171,6 +4507,11 @@ class Backend:
                     current["requested"] = {"mode": "incremental", "limit": None}
                     self.recent_windows[key]["background_pending"] = True
                     return dict(current)
+                if current["requested"]["mode"] == "backlog" and mode != "backlog":
+                    # The waking walk owns this conversation's fragment bookkeeping; the
+                    # other pass starts once the walk ends instead of interleaving with it.
+                    current["pendingMode"] = {"mode": mode, "limit": limit}
+                    return dict(current)
                 if mode == "incremental" and current["requested"]["mode"] != "incremental":
                     current["requested"] = {"mode": "incremental", "limit": None}
                     if key in self.recent_windows and current["status"] == "done":
@@ -4180,6 +4521,15 @@ class Backend:
                         self.priority_recent[key] = max(self.priority_recent.get(key, 0), 80)
                 elif mode == "incremental" and current["requested"]["mode"] == "incremental":
                     self.incremental_recheck.add(key)
+                elif mode == "backlog":
+                    # Repeat walks only resume: a finished walk reports itself exhausted.
+                    if not current.get("backlogExhausted"):
+                        current["requested"] = {"mode": "backlog", "limit": limit}
+                        current["backlogOffset"] = min(offset, current.get("backlogOffset", 0))
+                        if current["status"] == "done":
+                            current["status"] = "queued"
+                            self._enqueue((key, "backlog", limit, store, current, (account, workdir)))
+                    return dict(current)
                 elif mode == "history" and current["requested"]["mode"] != "incremental" and scope_rank(limit) > scope_rank(current["requested"]["limit"]):
                     current["requested"] = {"mode": "history", "limit": limit}
                     if key in self.recent_windows and current["status"] == "done":
@@ -4189,12 +4539,18 @@ class Backend:
                 return dict(current)
             job = {"id": uuid.uuid4().hex, "status": "queued", "total": 0, "processed": 0,
                    "requested": {"mode": mode, "limit": limit}}
+            if mode == "backlog":
+                job["backlogOffset"] = offset
             self.jobs[key] = job
             if mode == "recent":
                 self._schedule_recent(key, store, job, (account, workdir), limit, standalone=True)
                 return dict(job)
+            # The packed recent pass may only run where the message-level engine owns the
+            # cursor: on the batch path it writes fragments the forward scan cannot merge,
+            # so newest-first coverage comes from the backwards walk instead.
             if (not self.batch_engine and
-                    ((mode == "incremental" and not self._stored_progress(account, user, version, store)["complete"]) or
+                    ((mode == "incremental" and
+                      not self._stored_progress(account, user, version, store)["complete"]) or
                      (mode == "history" and limit == "all"))):
                 self.priority_recent[key] = 80
             self._enqueue((key, mode, limit, store, job, (account, workdir)))
@@ -4330,34 +4686,22 @@ class Backend:
             yield page
             after = cursor
 
+
     def _take_recent_priority(self, key):
         with self.jobs_lock:
             return self.priority_recent.pop(key, 0)
 
     def _fine_portrait_context(self, account, user, version, store, item):
-        if not self.batch_engine:
-            return None
-        group = user.endswith("@chatroom")
-        member = item.get("senderId") if group else None
-        if group and not member:
-            return None
-        saved = self.batch_engine.snapshot(account, user, version, store, member)
-        if not saved:
-            return None
-        state = saved["state"]
-        count = int(state.get("targetCount") or 0)
-        if count < 3:
-            return None
-        parts = [f"画像{count}条"]
-        traits = sorted(traits_from_state(state), key=lambda item: item["val"], reverse=True)
-        parts.extend(f"{item['label'][:4]}{item['val']}" for item in traits[:2])
-        broad = state.get("broad") or {}
-        if broad:
-            parts.append(f"常见意图{str(max(broad, key=broad.get))[:6]}")
-        mood = mood_from_progress(state)
-        if mood and mood.get("label"):
-            parts.append(f"情绪{str(mood['label'])[:4]}")
-        return "；".join(parts)[:60]
+        """Deliberately empty: a conversation's portrait must not colour one message.
+
+        Passing the stored portrait as extra state made single messages inherit the
+        conversation's overall mood. Measured on 老妈 (portrait: 2959 messages, mood 冷淡):
+        `乒乓球拍还在你阿姨那里，晚点我去拿回来` with its three real preceding messages
+        scores 亲近 68% / 开心 30% / 难过 0.1%, and the same three messages plus the portrait
+        score 难过 56% / 亲近 29% / 平静 6%. The portrait is useful for the profile view, not
+        for judging one message, so the fine pass runs without it.
+        """
+        return None
 
     def _run_fine_recent(self, account, user, version, store, job, scope, limit):
         self._assert_scope(scope)
@@ -4701,6 +5045,65 @@ class Backend:
         store.advance(account, user, version, final_cursor, context, complete=True)
         job["checkpointComplete"] = True
 
+    def _run_backlog_turn(self, key, store, job, scope, limit):
+        """Drive one chunk of the backwards walk, then queue the next older chunk."""
+        account, _, user, version = key
+        offset = int(job.get("backlogOffset") or 0)
+        if job.get("backlogExhausted") or offset >= BACKLOG_MAX_OFFSET:
+            job["backlogExhausted"] = True
+            job["status"] = "done"
+            self._seed_forward_cursor(account, user, version, store, job.get("backlogOldest"))
+            return
+        # Switching direction: the other pass may not keep a live generator, or it would
+        # resume mid-region and rewrite fragments this walk already wrote.
+        stale = self.history_iterators.pop(key, None)
+        if stale is not None:
+            stale.close()
+            self.history_iterator_modes.pop(key, None)
+        iterator = self.backlog_iterators.get(key)
+        if iterator is None or self.backlog_iterator_offsets.get(key) != offset:
+            if iterator is not None:
+                iterator.close()
+            iterator = self._run_backlog(account, user, version, store, job, scope, limit, offset)
+            self.backlog_iterators[key] = iterator
+            self.backlog_iterator_offsets[key] = offset
+        try:
+            next(iterator)
+        except StopIteration:
+            self.backlog_iterators.pop(key, None)
+            self.backlog_iterator_offsets.pop(key, None)
+            job["status"] = "done" if (job.get("backlogExhausted") or
+                                        (job.get("backlogOffset") or 0) >= BACKLOG_MAX_OFFSET) else "queued"
+            if job["status"] == "done":
+                job["backlogExhausted"] = True
+                self._seed_forward_cursor(account, user, version, store, job.get("backlogOldest"))
+                pending = job.pop("pendingMode", None)
+                if pending:
+                    job["requested"] = dict(pending)
+                    job["status"] = "queued"
+                    self._enqueue((key, pending["mode"], pending["limit"], store, job, scope))
+            else:
+                self._enqueue((key, "backlog", limit, store, job, scope))
+        else:
+            job["status"] = "queued"
+            self._enqueue((key, "backlog", limit, store, job, scope))
+
+    def _seed_forward_cursor(self, account, user, version, store, position):
+        """Let the forward scan pick up where the backwards walk stopped."""
+        if not position:
+            return
+        try:
+            store.advance(account, user, version, tuple(position), [], item=None)
+        except Exception:
+            pass
+
+    def _run_backlog(self, account, user, version, store, job, scope, limit, offset):
+        """Bounded backwards walk: newest packed batch first, older batches after it."""
+        if not self.batch_engine:
+            return
+        yield from self.batch_engine.backlog(account, user, version, store, job, scope,
+                                             limit, offset)
+
     def _run_finite_history(self, account, user, version, store, job, scope, limit):
         if self.batch_engine:
             yield from self.batch_engine.recent(account, user, version, store, job, scope, limit)
@@ -4801,23 +5204,197 @@ class Backend:
                     job["status"] = "error"
                     job["error"] = str(exc)[:200]
 
-    def _worker(self):
+    def _release_worker(self, index):
+        """Give a parked worker's model back to the system; it relaunches on demand."""
+        if index >= len(self._analyzers):
+            return
+        analyzer = self._analyzers[index]
+        close = getattr(analyzer, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception:
+            pass
+
+    def _set_worker_limit(self, limit):
+        limit = max(0, min(self.worker_count, limit))
+        with self.load_condition:
+            if limit == self.worker_limit:
+                return
+            self.worker_limit = limit
+            self.load_condition.notify_all()
+        # Only a fully parked pool gives its models back: the machine is out of room, so the
+        # VRAM matters more than the reload. A merely throttled worker keeps its model warm,
+        # otherwise every round would pay the model load again.
+        if limit == 0:
+            for index in range(len(self._analyzers)):
+                if index not in self.worker_busy:
+                    self._release_worker(index)
+
+    def _respawn_dead_workers(self):
+        """Self-heal the pool: a worker that died leaves queued work with nobody to run it."""
+        if self.closing:
+            return
+        for index, worker in enumerate(self.workers):
+            if worker.is_alive():
+                continue
+            replacement = threading.Thread(target=self._worker, args=(index,), daemon=True)
+            self.workers[index] = replacement
+            replacement.start()
+
+    def _sample_load(self):
+        sample = {"cpu": None, "ownCpu": None, "otherCpu": None, "ownSeconds": None,
+                  "memory": None, "gpu": None, "gpuFreeMiB": None}
+        try:
+            import psutil
+            # Only other applications' load should throttle us, so this bridge and its model
+            # workers are measured by their own CPU seconds and subtracted from the system
+            # percentage (which is per machine, while a process total is per core).
+            total = psutil.cpu_percent(interval=None)
+            process = psutil.Process()
+            seconds = 0.0
+            for item in [process, *process.children(recursive=True)]:
+                try:
+                    times = item.cpu_times()
+                except Exception:
+                    continue
+                seconds += times.user + times.system
+            sample["cpu"] = total
+            sample["ownSeconds"] = seconds
+            sample["memory"] = psutil.virtual_memory().percent
+        except Exception:
+            pass
+        try:
+            probe = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if probe.returncode == 0 and probe.stdout.strip():
+                parts = [item.strip() for item in probe.stdout.strip().splitlines()[0].split(",")]
+                sample["gpu"] = float(parts[0])
+                sample["gpuFreeMiB"] = float(parts[2]) - float(parts[1])
+        except Exception:
+            pass
+        return sample
+
+    def _apply_load_sample(self, sample):
+        """Move the elastic limit one step towards the current machine pressure."""
+        now = time.monotonic()
+        own_share = None
+        previous = self.load_own_seconds
+        if sample.get("ownSeconds") is not None and previous is not None:
+            elapsed = now - previous[0]
+            if elapsed > 0:
+                cores = self.load_cores
+                own_share = min(100.0, (sample["ownSeconds"] - previous[1]) / elapsed / cores * 100.0)
+        if sample.get("ownSeconds") is not None:
+            self.load_own_seconds = (now, sample["ownSeconds"])
+        sample["ownCpu"] = own_share
+        sample["otherCpu"] = (None if own_share is None or sample["cpu"] is None
+                               else max(0.0, sample["cpu"] - own_share))
+        # The whole machine decides: our own workers make the desktop client stutter too, so
+        # a saturated machine throttles us whoever caused it. ownCpu/otherCpu stay as
+        # diagnostics for the progress tooltip.
+        cpu = sample["cpu"]
+        memory = sample["memory"]
+        gpu, free = sample["gpu"], sample["gpuFreeMiB"]
+        busy = ((cpu is not None and cpu >= ELASTIC_BUSY_CPU) or
+                (memory is not None and memory >= ELASTIC_BUSY_MEMORY) or
+                (gpu is not None and gpu >= ELASTIC_BUSY_GPU) or
+                (free is not None and free < ELASTIC_BUSY_FREE_VRAM_MIB))
+        calm = ((cpu is None or cpu <= ELASTIC_CALM_CPU) and
+                (memory is None or memory <= ELASTIC_CALM_MEMORY) and
+                (gpu is None or gpu <= ELASTIC_CALM_GPU) and
+                (free is None or free >= ELASTIC_CALM_FREE_VRAM_MIB))
+        with self.load_condition:
+            self.load_sample = sample
+            if busy:
+                self.load_streak = {"up": 0, "down": self.load_streak["down"] + 1}
+            elif calm:
+                self.load_streak = {"up": self.load_streak["up"] + 1, "down": 0}
+            else:
+                self.load_streak = {"up": 0, "down": 0}
+            limit = self.worker_limit
+            if busy and self.load_streak["down"] >= ELASTIC_RAMP_SAMPLES:
+                # A machine under real pressure keeps at most one worker; a full GPU or an
+                # almost-full VRAM parks all of them until it frees up.
+                floor = 1
+                if ((free is not None and free < ELASTIC_STOP_FREE_VRAM_MIB) or
+                        (gpu is not None and gpu >= 95)):
+                    floor = 0
+                limit = max(floor, limit - 1)
+                self.load_streak = {"up": 0, "down": 0}
+            elif calm and self.load_streak["up"] >= ELASTIC_RAMP_SAMPLES:
+                limit = min(self.worker_count, limit + 1)
+                self.load_streak = {"up": 0, "down": 0}
+        self._set_worker_limit(limit)
+
+    def _load_monitor(self):
         while True:
+            with self.load_condition:
+                if self.closing:
+                    return
+            self._apply_load_sample(self._sample_load())
+            self._respawn_dead_workers()
+            with self.load_condition:
+                if self.closing:
+                    return
+                self.load_condition.wait(timeout=ELASTIC_SAMPLE_SECONDS)
+
+    def _worker(self, index=0):
+        # Each worker drives its own model process; the property resolves it per thread.
+        self._analyzer_ctx.index = index
+        while True:
+            if self.elastic_workers:
+                with self.load_condition:
+                    while not self.closing and index >= self.worker_limit:
+                        self.load_condition.wait(timeout=5)
+                if index >= self.worker_limit and index not in self.worker_busy:
+                    # Parked workers give the model back: otherwise their VRAM keeps the
+                    # machine above the recovery threshold and the pool never scales up.
+                    self._release_worker(index)
             _, _, task = self.tasks.get()
             if task is None:
                 self.tasks.task_done()
                 return
-            key, mode, limit, store, job, source_scope = task
+            lock = self._key_lock(task[0])
+            if not lock.acquire(blocking=False):
+                # Another worker is inside this conversation; take something else and
+                # come back to this task instead of blocking a whole worker on it.
+                self.tasks.task_done()
+                self._enqueue(task)
+                time.sleep(0.02)
+                continue
+            self.worker_busy.add(index)
+            try:
+                self._run_one(task)
+            except Exception as exc:
+                # A worker must survive any single task: losing a thread here used to leave
+                # queued work with nobody to run it, with no visible error anywhere.
+                print(f"analysis worker error: {type(exc).__name__}: {exc}", file=sys.stderr,
+                      flush=True)
+                job = task[4]
+                if isinstance(job, dict):
+                    with self.jobs_lock:
+                        job["status"] = "error"
+                        job["error"] = str(exc)[:200]
+            finally:
+                self.worker_busy.discard(index)
+                lock.release()
+
+    def _run_one(self, task):
+        key, mode, limit, store, job, source_scope = task
+        try:
             if store.cache_suspended(key[0], LOCAL_SOURCE_ID):
                 job["status"] = "suspended"
-                self.tasks.task_done()
-                continue
+                return
             if self.active_model_source_mode != "local":
                 # Local Laya analysis must not compete with an active API source. The
                 # persisted cursor is kept; a later local switch resumes from it.
                 job["status"] = "paused"
-                self.tasks.task_done()
-                continue
+                return
             if mode == "batch-subject" and self.batch_engine:
                 try:
                     member_key = (*key, limit)
@@ -4839,15 +5416,13 @@ class Backend:
                     self.quoted_backfill_iterators.pop((*key, limit), None)
                     job["status"] = "error"
                     job["error"] = str(exc)[:200]
-                finally:
-                    self.tasks.task_done()
-                continue
+                return
             if mode == "recent-window":
-                try:
-                    self._run_recent_turn(key, store, job, source_scope)
-                finally:
-                    self.tasks.task_done()
-                continue
+                self._run_recent_turn(key, store, job, source_scope)
+                return
+            if mode == "backlog":
+                self._run_backlog_turn(key, store, job, source_scope, limit)
+                return
             account, _, user, version = key
             terminal = True
             try:
@@ -4905,7 +5480,7 @@ class Backend:
                     else:
                         terminal = False
                         self._enqueue((key, mode, limit, store, job, source_scope))
-                    continue
+                    return
                 raise RuntimeError("unsupported analysis mode")
             except Exception as exc:
                 with self.jobs_lock:
@@ -4918,7 +5493,8 @@ class Backend:
                     with self.jobs_lock:
                         self.priority_recent.pop(key, None)
                         self.incremental_recheck.discard(key)
-                self.tasks.task_done()
+        finally:
+            self.tasks.task_done()
 
     def analysis(self, user):
         account, workdir, store = self._scoped_identity()

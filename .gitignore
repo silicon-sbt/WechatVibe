@@ -4,6 +4,7 @@
 node_modules/
 release-real-client/
 dist/
+WechatVibe/
 __pycache__/
 *.pyc
 *.pyo

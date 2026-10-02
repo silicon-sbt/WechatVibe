@@ -137,6 +137,12 @@ def make_handler(backend, accounts=None, control_token=None):
                     return self.send(200, data)
                 if parsed.path == "/api/conversation-selection":
                     return self.send(200, backend.conversation_selection())
+                if parsed.path == "/api/analysis-workers":
+                    return self.send(200, backend.worker_status())
+                if parsed.path == "/api/analysis-overview":
+                    return self.send(200, backend.analysis_overview())
+                if parsed.path == "/api/analysis-performance":
+                    return self.send(200, backend.analysis_performance())
                 if parsed.path == "/api/accounts" and accounts is not None:
                     return self.send(200, accounts.list())
                 if parsed.path == "/api/messages":
@@ -206,6 +212,7 @@ def make_handler(backend, accounts=None, control_token=None):
                                  "/api/runtime", "/api/local-model", "/api/model-insights",
                                  "/api/model-portrait", "/api/analysis-cache/clear",
                                  "/api/analysis-cache/resume", "/api/conversation-selection",
+                                 "/api/analysis-workers",
                                  *model_endpoints):
                 return self.send(404, {"error": "not found"})
             content_type = [part.strip().lower() for part in self.headers.get("Content-Type", "").split(";")]
@@ -234,7 +241,18 @@ def make_handler(backend, accounts=None, control_token=None):
                         return self.send(503, {"error": str(exc)})
                     except Exception:
                         return self.send(503, {"error": "model source unavailable"})
+                if endpoint == "/api/analysis-workers":
+                    workers = request.get("workers")
+                    elastic = request.get("elastic")
+                    if workers is not None and (type(workers) is not int or not 1 <= workers <= 8):
+                        raise ValueError("invalid worker count")
+                    if elastic is not None and type(elastic) is not bool:
+                        raise ValueError("invalid elastic flag")
+                    return self.send(200, backend.set_worker_settings(workers, elastic))
                 if endpoint == "/api/conversation-selection":
+                    if set(request) == {"expectedAccount", "all"} and request["all"] is True:
+                        return self.send(200, backend.set_conversation_all_selected(
+                            user_value(request["expectedAccount"])))
                     if set(request) != {"expectedAccount", "session", "selected"} or type(request["selected"]) is not bool:
                         raise ValueError("invalid conversation selection")
                     return self.send(200, backend.set_conversation_selected(
@@ -307,12 +325,22 @@ def make_handler(backend, accounts=None, control_token=None):
                 user = user_value(request.get("user"))
                 expected_account = user_value(request.get("account"))
                 mode = request.get("mode")
-                if mode not in ("recent", "history", "incremental"):
+                if mode not in ("recent", "history", "incremental", "backlog"):
                     raise ValueError("invalid mode")
+                offset = request.get("offset", 0)
+                if mode == "backlog":
+                    if type(offset) is not int or not 0 <= offset <= 100000:
+                        raise ValueError("invalid offset")
+                    limit = integer(request.get("limit"), 200, 500)
+                    return self.send(202, {"job": backend.start(user, mode, limit,
+                                                                 expected_account=expected_account,
+                                                                 offset=offset)})
+                if offset != 0:
+                    raise ValueError("invalid offset")
                 limit = (None if mode == "incremental" else
                          "all" if mode == "history" and request.get("limit") == "all" else
                          integer(request.get("limit"), 80 if mode == "recent" else 500,
-                                 80 if mode == "recent" else 5000))
+                                 300 if mode == "recent" else 5000))
                 return self.send(202, {"job": backend.start(user, mode, limit,
                                                              expected_account=expected_account)})
             except ForecastRequestError as exc:

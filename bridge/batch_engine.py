@@ -192,6 +192,54 @@ class BatchEngine:
             yield
         job["processed"] = job["total"] = len(self.text_items(window[-limit:]))
 
+    def backlog(self, account, user, version, store, job, scope, limit, offset, member=None):
+        """Walk one conversation backwards from its newest message.
+
+        The forward scan starts at the oldest message, so on a large account the months the
+        user actually reads are analysed last. This pass takes the same packed batches from
+        the newest end instead; coverage and portraits fill where recent messages live.
+        """
+        subject = self.subject(user, member)
+        saved = self.ensure(account, user, version, store, scope, member)
+        forward = saved.get("cursor") if isinstance(saved, dict) else None
+        window = self.backend.source.messages(user, limit + 3, offset)
+        texts = self.text_items(window)
+        job["backlogOffset"] = offset
+        if not texts:
+            job["backlogExhausted"] = True
+            return
+        if (forward is not None and len(texts) >= limit and
+                tuple(texts[-limit]["_sort"]) <= tuple(forward)):
+            # Met the forward scan: both passes write fragment rows for a message, so they
+            # must never share one. Everything newer is covered, the older half is its job.
+            job["backlogExhausted"] = True
+            return
+        context = self.context(texts[:-limit] if len(texts) > limit else [])
+        items = texts[-limit:]
+        if items:
+            # Remember the oldest position this walk reached: the forward scan resumes there
+            # instead of walking the newest messages again.
+            job["backlogOldest"] = list(items[0]["_sort"])
+        completed = 0
+        while items:
+            known = self.known(account, user, version, store, subject, items)
+            first = next((index for index, item in enumerate(items) if item["id"] not in known), None)
+            if first is None:
+                break
+            context = self.context([*context, *items[:first]])
+            items = items[first:]
+            cursor, char_offset, context = self.infer(account, user, version, store, scope,
+                                                      subject, items, context, advance=False)
+            completed += len(known)
+            job["processed"] = job.get("processed", 0) + len(known)
+            items = [item for item in items if tuple(item["_sort"]) > cursor or
+                     (char_offset and tuple(item["_sort"]) == cursor)]
+            yield
+        job["backlogOffset"] = offset + limit
+        job["backlogCovered"] = job.get("backlogCovered", 0) + completed
+        if getattr(window, "hasMoreBefore", None) is False:
+            job["backlogExhausted"] = True
+
     def incremental(self, account, user, version, store, job, scope, key, member=None):
         subject = self.subject(user, member)
         batches = self.store(store)
