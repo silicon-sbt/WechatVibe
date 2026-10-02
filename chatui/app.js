@@ -103,6 +103,7 @@ chatState.sessions = new Map();
 chatState.selectedConversations = new Set();
 chatState.selectionLoadedAccount = null;
 chatState.conversationSelectionBusy = false;
+chatState.allConversationsTracked = false;
 chatState.sessionCache = new Map();
 portraitState.profileCache = new Map();
 const sessionCacheMessageLimit = 80;
@@ -728,16 +729,77 @@ async function preloadSessionWindows(account, nextSessions, request) {
   }
   return true;
 }
+function validConversationSelection(state, account) {
+  return Boolean(state) && state.account === account && Array.isArray(state.selectedSessions) &&
+    state.selectedSessions.every(id => typeof id === "string");
+}
 async function loadConversationSelection(account, request) {
   if (chatState.selectionLoadedAccount === account) return;
-  const state = await api("/api/conversation-selection");
+  let state = await api("/api/conversation-selection");
   if (request !== chatState.sessionRequest || accountClearedExiting) return;
-  if (state?.account !== account || !Array.isArray(state.selectedSessions) ||
-      state.selectedSessions.some(id => typeof id !== "string"))
+  if (!validConversationSelection(state, account))
     throw new Error("Invalid conversation selection response");
+  if (state.initialized === false) {
+    // First launch for this account: put every conversation into the sidebar at once.
+    try {
+      const filled = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+        expectedAccount: account, all: true,
+      }) });
+      if (request !== chatState.sessionRequest || accountClearedExiting) return;
+      if (validConversationSelection(filled, account)) state = filled;
+    } catch { /* keep the empty selection and let the user add conversations manually */ }
+  }
   chatState.selectedConversations.clear();
   for (const id of state.selectedSessions) chatState.selectedConversations.add(id);
   chatState.selectionLoadedAccount = account;
+}
+// Once every conversation is in the sidebar, keep conversations that appear later
+// in sync, so a chat started afterwards does not silently stay out of the list.
+async function trackNewConversations(account) {
+  if (chatState.conversationSelectionBusy || !chatState.selectionLoadedAccount ||
+      account !== chatState.currentAccount) return;
+  if ([...chatState.sessions.keys()].every(id => chatState.selectedConversations.has(id))) return;
+  chatState.conversationSelectionBusy = true;
+  try {
+    const state = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+      expectedAccount: account, all: true,
+    }) });
+    if (account !== chatState.currentAccount || !validConversationSelection(state, account)) return;
+    chatState.selectedConversations.clear();
+    for (const id of state.selectedSessions) chatState.selectedConversations.add(id);
+    renderSessions();
+    if (!byId("conversationManager").hidden) renderConversationManager();
+  } catch { /* retry on the next session refresh */ }
+  finally { chatState.conversationSelectionBusy = false; }
+}
+async function addAllConversations() {
+  const account = chatState.currentAccount;
+  if (!account || chatState.conversationSelectionBusy || !chatState.selectionLoadedAccount ||
+      !chatState.sessions.size) return;
+  chatState.conversationSelectionBusy = true;
+  text("conversationManagerStatus", "正在添加全部会话…");
+  renderConversationManager();
+  try {
+    const state = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+      expectedAccount: account, all: true,
+    }) });
+    if (account !== chatState.currentAccount || !validConversationSelection(state, account))
+      throw new Error("选择结果不匹配");
+    chatState.selectedConversations.clear();
+    for (const id of state.selectedSessions) chatState.selectedConversations.add(id);
+    chatState.allConversationsTracked = true;
+    renderSessions();
+    text("conversationManagerStatus", "已添加 " + chatState.selectedConversations.size + " 个会话");
+    if (!chatState.currentUser) {
+      const first = [...chatState.sessions.keys()].find(id => chatState.selectedConversations.has(id));
+      if (first) switchSession(first);
+    }
+  } catch {
+    text("conversationManagerStatus", "操作失败，请重试");
+  } finally {
+    chatState.conversationSelectionBusy = false;
+    renderConversationManager();
+  }
 }
 function clearUnselectedConversation() {
   if (chatState.currentUser) {
@@ -930,6 +992,10 @@ async function loadSessions(retryChanged = true) {
     renderSessions();
     if (!byId("conversationManager").hidden) renderConversationManager();
     byId("sessionList").scrollTop = scroll;
+    if (!chatState.allConversationsTracked && chatState.sessions.size &&
+        [...chatState.sessions.keys()].every(id => chatState.selectedConversations.has(id)))
+      chatState.allConversationsTracked = true;
+    if (chatState.allConversationsTracked) void trackNewConversations(data.account);
     if (!await preloadSessionWindows(data.account, nextSessions, request)) return;
     if (request !== chatState.sessionRequest || chatState.currentAccount !== data.account) return;
     let remembered = null;
@@ -4664,6 +4730,7 @@ byId("btnManageConversations").addEventListener("click", () => {
   }
 });
 byId("conversationSearch").addEventListener("input", renderConversationManager);
+byId("btnAddAllConversations").addEventListener("click", () => { void addAllConversations(); });
 byId("btnCloseSettings").addEventListener("click", closeSettingsModal);
 byId("settingsModal").addEventListener("click", event => { if (event.target === byId("settingsModal")) closeSettingsModal(); });
 byId("btnManageAccounts").addEventListener("click", () => {
