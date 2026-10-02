@@ -32,6 +32,12 @@ class ResultStore:
         self.path = path
         self.profile_lock = threading.RLock()
         with self.connect() as conn:
+            # Several analysis workers write this file; WAL keeps one worker's commit
+            # from blocking another worker's read for the whole transaction.
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.DatabaseError:
+                pass
             # Serialize first-time schema creation and nullable-column migration.
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("CREATE TABLE IF NOT EXISTS results_v2 (account TEXT NOT NULL, session TEXT NOT NULL, id TEXT NOT NULL, "
@@ -112,6 +118,23 @@ class ResultStore:
                          "PRIMARY KEY(account,session,version,subject))")
             conn.execute("CREATE INDEX IF NOT EXISTS results_profile_delta_v1 ON results_v2 (account,session,version)")
             conn.execute("CREATE INDEX IF NOT EXISTS results_member_delta_v1 ON results_v2 (account,session,version,sender)")
+
+    def analysis_progress_rows(self, account, version):
+        """Per-conversation scan state for the whole-account progress read.
+
+        Returns (session, subject, complete, state_json) rows: one per analysed subject,
+        where a group's overall row carries an empty subject.
+        """
+        with self.connect() as conn:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "batch_progress_v1" in tables:
+                return conn.execute(
+                    "SELECT session,subject,complete,state_json FROM batch_progress_v1 "
+                    "WHERE account=? AND base_version=?", (account, version)).fetchall()
+            return [(row[0], row[0], row[1], None) for row in conn.execute(
+                "SELECT session,complete FROM progress_v1 WHERE account=? AND version=?",
+                (account, version))]
 
     @contextmanager
     def connect(self):
