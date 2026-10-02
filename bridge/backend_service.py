@@ -85,6 +85,17 @@ def analysis_worker_settings():
             "elastic": True if elastic is None else bool(elastic)}
 
 
+def save_worker_settings(workers, elastic):
+    """Persist the local parallelism choice next to the other runtime state."""
+    path = ROOT / ".local" / "real-client-runtime" / "analysis-workers.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"workers": int(workers), "elastic": bool(elastic)},
+                                   ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 class Backend:
     def __init__(self, source, analyzer=None, store_factory=None, model_source_store=None,
                  selection_store=None):
@@ -1257,6 +1268,39 @@ class Backend:
         return {"account": account, "version": version, "conversations": len(users),
                 "scanned": scanned, "complete": complete, "analyzed": analyzed,
                 "textTotal": text_total, "running": running, "workers": workers}
+
+    def worker_status(self):
+        """Current local parallelism, for the settings row and the progress tooltip."""
+        with self.load_condition:
+            return {"workers": self.worker_count, "max": MAX_ANALYSIS_WORKERS,
+                    "elastic": self.elastic_workers, "limit": self.worker_limit,
+                    "active": len(self.worker_busy), **self.load_sample}
+
+    def set_worker_settings(self, workers=None, elastic=None):
+        """Resize the local worker pool and remember the choice for the next launch."""
+        with self.load_condition:
+            count = (self.worker_count if workers is None else
+                     max(1, min(MAX_ANALYSIS_WORKERS, int(workers))))
+            if elastic is not None:
+                self.elastic_workers = bool(elastic) and count > 1
+            self.worker_count = count
+            if self.workers:
+                for index in range(len(self._analyzers), count):
+                    self._analyzers.append(NodeAnalysis())
+                    thread = threading.Thread(target=self._worker, args=(index,), daemon=True)
+                    self.workers.append(thread)
+                    thread.start()
+            self.worker_limit = (max(1, min(self.worker_limit, count)) if self.elastic_workers
+                                 else count)
+            self.load_condition.notify_all()
+        for index in range(count, len(self._analyzers)):
+            if index not in self.worker_busy:
+                self._release_worker(index)
+        save_worker_settings(count, self.elastic_workers)
+        if self.elastic_workers and self.workers and self.load_monitor_thread is None:
+            self.load_monitor_thread = threading.Thread(target=self._load_monitor, daemon=True)
+            self.load_monitor_thread.start()
+        return self.worker_status()
 
     def analysis_performance(self):
         """Read-only timing breakdown of local analysis, for tuning and support."""

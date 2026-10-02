@@ -158,6 +158,8 @@ def make_handler(backend, accounts=None, control_token=None):
                     return self.send(200, backend.analysis_overview())
                 if parsed.path == "/api/analysis-performance":
                     return self.send(200, backend.analysis_performance())
+                if parsed.path == "/api/analysis-workers":
+                    return self.send(200, backend.worker_status())
                 if parsed.path == "/api/accounts" and accounts is not None:
                     return self.send(200, accounts.list())
                 if parsed.path == "/api/messages":
@@ -230,6 +232,7 @@ def make_handler(backend, accounts=None, control_token=None):
                                  "/api/runtime", "/api/local-model", "/api/model-insights",
                                  "/api/model-portrait", "/api/analysis-cache/clear",
                                  "/api/analysis-cache/resume", "/api/conversation-selection",
+                                 "/api/analysis-workers",
                                  *model_endpoints):
                 return self.send(404, {"error": "not found"})
             content_type = [part.strip().lower() for part in self.headers.get("Content-Type", "").split(";")]
@@ -258,6 +261,14 @@ def make_handler(backend, accounts=None, control_token=None):
                         return self.send(503, {"error": str(exc)})
                     except Exception:
                         return self.send(503, {"error": "model source unavailable"})
+                if endpoint == "/api/analysis-workers":
+                    workers = request.get("workers")
+                    if workers is not None and (type(workers) is not int or not 1 <= workers <= 4):
+                        raise ValueError("invalid worker count")
+                    elastic = request.get("elastic")
+                    if elastic is not None and type(elastic) is not bool:
+                        raise ValueError("invalid elastic flag")
+                    return self.send(200, backend.set_worker_settings(workers, elastic))
                 if endpoint == "/api/conversation-selection":
                     if set(request) == {"expectedAccount", "all"} and request["all"] is True:
                         return self.send(200, backend.set_conversation_all_selected(
