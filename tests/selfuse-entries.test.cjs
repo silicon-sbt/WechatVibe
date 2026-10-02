@@ -20,6 +20,17 @@ it("ships every self-use entry point in the sidebar and settings modal", () => {
   }
 });
 
+it("renders image messages from the local bridge with a zoom and retry path", () => {
+  const css = readFileSync(path.join(root, "chatui/style.css"), "utf8");
+  assert.ok(app.includes('image.className = "msg-image"'));
+  assert.ok(app.includes('"/api/media?user="'));
+  assert.ok(app.includes('image.classList.toggle("zoomed")'));
+  assert.ok(app.includes('&retry=" + attempts'));
+  assert.ok(app.includes('element("div", "msg-bubble", "[图片]")'));
+  assert.ok(css.includes(".msg-image {"));
+  assert.ok(css.includes(".msg-image.zoomed {"));
+});
+
 it("keeps the self-use calls on the documented bridge endpoints", () => {
   assert.ok(app.includes('"/api/conversation-selection"'));
   assert.ok(app.includes('"/api/analysis-overview"'));
