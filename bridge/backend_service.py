@@ -13,6 +13,7 @@ import json
 import math
 import os
 import queue
+import subprocess
 import threading
 import time
 import uuid
@@ -121,6 +122,7 @@ class Backend:
         self.load_streak = {"up": 0, "down": 0}
         self.worker_busy = set()
         self.load_monitor_thread = None
+        self._load_processes = None
         self._analyzers = ([analyzer] if analyzer is not None else
                            [NodeAnalysis() for _ in range(self.worker_count)])
         self.key_locks = {}
@@ -213,9 +215,17 @@ class Backend:
         for worker in self.workers:
             worker.start()
         self.worker_thread = self.workers[0]
-        if self.elastic_workers and self.load_monitor_thread is None:
-            self.load_monitor_thread = threading.Thread(target=self._load_monitor, daemon=True)
-            self.load_monitor_thread.start()
+        self._ensure_load_monitor()
+
+    def _ensure_load_monitor(self):
+        """Elastic mode needs exactly one sampler; restart it after a drain stopped it."""
+        if not self.elastic_workers:
+            return
+        thread = self.load_monitor_thread
+        if thread is not None and thread.is_alive():
+            return
+        self.load_monitor_thread = threading.Thread(target=self._load_monitor, daemon=True)
+        self.load_monitor_thread.start()
 
     def _stop_workers(self):
         with self.load_condition:
@@ -226,6 +236,9 @@ class Backend:
             worker.join(timeout=200)
         if any(worker.is_alive() for worker in self.workers):
             raise RuntimeError("bridge worker did not stop")
+        monitor = self.load_monitor_thread
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=ELASTIC_SAMPLE_SECONDS + 5)
 
     def _key_lock(self, key):
         """One conversation is driven by one worker at a time; others run in parallel."""
@@ -1350,9 +1363,7 @@ class Backend:
             if index not in self.worker_busy:
                 self._release_worker(index)
         save_worker_settings(count, self.elastic_workers)
-        if self.elastic_workers and self.workers and self.load_monitor_thread is None:
-            self.load_monitor_thread = threading.Thread(target=self._load_monitor, daemon=True)
-            self.load_monitor_thread.start()
+        self._ensure_load_monitor()
         return self.worker_status()
 
     def analysis_performance(self):
@@ -2700,6 +2711,34 @@ class Backend:
             if index not in self.worker_busy:
                 self._release_worker(index)
 
+    def _own_cpu_percent(self, psutil):
+        """CPU% of this process and its children.
+
+        `cpu_percent(interval=None)` is a delta since the previous call *on the same
+        Process object*, so the objects are kept between samples; a freshly built Process
+        would report 0.0 forever and make our own load look like idle.
+        """
+        if self._load_processes is None:
+            self._load_processes = {}
+        processes = self._load_processes
+        try:
+            root = processes.get(os.getpid()) or psutil.Process()
+            processes[os.getpid()] = root
+            for child in root.children(recursive=True):
+                processes.setdefault(child.pid, child)
+        except Exception:
+            pass
+        own = 0.0
+        for pid, process in list(processes.items()):
+            try:
+                if not process.is_running():
+                    processes.pop(pid, None)
+                    continue
+                own += process.cpu_percent(interval=None)
+            except Exception:
+                processes.pop(pid, None)
+        return own
+
     def _sample_load(self):
         sample = {"cpu": None, "ownCpu": None, "otherCpu": None,
                   "memory": None, "gpu": None, "gpuFreeMiB": None}
@@ -2709,14 +2748,8 @@ class Backend:
             # are measured and subtracted: a process percentage is per core, the system
             # percentage is per machine.
             total = psutil.cpu_percent(interval=None)
-            process = psutil.Process()
-            own = 0.0
-            for item in [process, *process.children(recursive=True)]:
-                try:
-                    own += item.cpu_percent(interval=None)
-                except Exception:
-                    continue
             cores = psutil.cpu_count() or 1
+            own = self._own_cpu_percent(psutil)
             sample["cpu"] = total
             sample["ownCpu"] = min(100.0, own / cores)
             sample["otherCpu"] = max(0.0, total - sample["ownCpu"])
@@ -2774,15 +2807,22 @@ class Backend:
         self._set_worker_limit(limit)
 
     def _load_monitor(self):
-        while True:
+        try:
+            while True:
+                with self.load_condition:
+                    if self.closing:
+                        return
+                self._apply_load_sample(self._sample_load())
+                with self.load_condition:
+                    if self.closing:
+                        return
+                    self.load_condition.wait(timeout=ELASTIC_SAMPLE_SECONDS)
+        finally:
+            # Leaving the handle set would make _ensure_load_monitor believe a sampler is
+            # still running, so resuming after an account clear never restarted elastic mode.
             with self.load_condition:
-                if self.closing:
-                    return
-            self._apply_load_sample(self._sample_load())
-            with self.load_condition:
-                if self.closing:
-                    return
-                self.load_condition.wait(timeout=ELASTIC_SAMPLE_SECONDS)
+                if self.load_monitor_thread is threading.current_thread():
+                    self.load_monitor_thread = None
 
     def _worker(self, index=0):
         # Each worker drives its own model process; the property resolves it per thread.
@@ -2794,10 +2834,18 @@ class Backend:
                         self.load_condition.wait(timeout=5)
                 if index >= self.worker_limit and index not in self.worker_busy:
                     self._release_worker(index)
-            _, _, task = self.tasks.get()
+            item = self.tasks.get()
+            _, _, task = item
             if task is None:
                 self.tasks.task_done()
                 return
+            if self.elastic_workers and not self.closing and index >= self.worker_limit:
+                # The limit can drop while this worker is already blocked on the queue. Hand
+                # the task back so only workers the limit still allows start it, then park at
+                # the top of the loop; without this a zero limit kept starting inferences.
+                self.tasks.put(item)
+                self.tasks.task_done()
+                continue
             lock = self._key_lock(task[0])
             if not lock.acquire(blocking=False):
                 # Another worker is inside this conversation; take something else and

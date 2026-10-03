@@ -3,6 +3,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
@@ -77,6 +78,97 @@ class AnalysisWorkerSettingsTests(unittest.TestCase):
             self.assertEqual(data["workers"], 1)
             saved.assert_called_once_with(1, False)
 
+
+
+class ElasticWorkerTests(unittest.TestCase):
+    """The review of the parallel-workers PR found four defects; each test pins one."""
+
+    def _elastic_backend(self, workers=2):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        with mock.patch("backend_service.save_worker_settings"):
+            backend = Backend(StubSource(root / "snapshot"), StubAnalyzer(),
+                              selection_store=ConversationSelectionStore(root / "results"))
+        self.addCleanup(self._drain, backend)
+        backend._stop_workers()
+        backend._analyzers = [StubAnalyzer() for _ in range(workers)]
+        backend.worker_count = workers
+        backend.elastic_workers = True
+        backend.worker_limit = workers
+        # These tests drive the limit themselves: a live sampler would ramp it back up, and a
+        # calm machine legitimately restores the ceiling after two samples.
+        backend._apply_load_sample = lambda sample: None
+        backend._sample_load = self._calm
+        return backend
+
+    def _drain(self, backend):
+        try:
+            backend.closing = True
+            backend._stop_workers()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _calm():
+        # A fixed sample keeps the monitor off psutil and nvidia-smi inside the unit tests.
+        return {"cpu": 1.0, "ownCpu": 1.0, "otherCpu": 0.0, "memory": 10.0,
+                "gpu": 0.0, "gpuFreeMiB": 8000.0}
+
+    def test_the_gpu_probe_actually_reaches_nvidia_smi(self):
+        # `subprocess` was never imported, so the probe raised NameError, the broad except
+        # swallowed it, and the sampler saw a machine that was always calm.
+        backend = self._elastic_backend()
+        probe = mock.Mock(returncode=0, stdout="82, 4700, 8188\n", stderr="")
+        with mock.patch("subprocess.run", return_value=probe) as run:
+            sample = Backend.__dict__["_sample_load"](backend)
+        self.assertTrue(run.called)
+        self.assertEqual(sample["gpu"], 82.0)
+        self.assertEqual(sample["gpuFreeMiB"], 3488.0)
+
+    def test_own_cpu_keeps_the_same_process_objects(self):
+        # cpu_percent(interval=None) is a delta on the same Process object; rebuilding it
+        # every sample made our own load read as 0.0 forever.
+        backend = self._elastic_backend()
+        process = mock.Mock(pid=4242)
+        process.children.return_value = []
+        process.cpu_percent.return_value = 7.0
+        psutil = mock.Mock()
+        psutil.Process.return_value = process
+        self.assertEqual(backend._own_cpu_percent(psutil), 7.0)
+        self.assertEqual(backend._own_cpu_percent(psutil), 7.0)
+        self.assertEqual(psutil.Process.call_count, 1)
+
+    def test_a_task_waits_instead_of_starting_after_the_limit_drops(self):
+        # Both workers are already blocked on the queue when the limit drops to zero. Without
+        # the requeue they still took the next task, so the pool kept starting inferences
+        # while the machine had asked it to stand down.
+        backend = self._elastic_backend(workers=2)
+        backend._start_workers()
+        time.sleep(0.3)
+        backend._set_worker_limit(0)
+        backend.tasks.put((1, next(backend.task_serial), ("session-key",)))
+        time.sleep(0.4)
+        self.assertEqual(backend.tasks.qsize(), 1, "a parked worker took the task")
+        backend.tasks.get()
+        backend.tasks.task_done()
+
+    def test_the_sampler_restarts_after_a_drain(self):
+        # The monitor returns when the bridge closes; leaving the handle set meant an account
+        # clear could never bring elastic mode back.
+        backend = self._elastic_backend()
+        backend._start_workers()
+        first = backend.load_monitor_thread
+        self.assertIsNotNone(first)
+        backend.closing = True
+        backend._stop_workers()
+        self.assertIsNone(backend.load_monitor_thread)
+        backend.closing = False
+        backend._ensure_load_monitor()
+        second = backend.load_monitor_thread
+        self.assertIsNotNone(second)
+        self.assertIsNot(second, first)
+        backend.closing = True
 
 if __name__ == "__main__":
     unittest.main()
