@@ -98,6 +98,18 @@ class ConversationSelectionHTTPTests(unittest.TestCase):
         self.assertTrue(self.source.identity_checks)
         self.assertEqual(set(self.source.identity_checks), {False})
 
+    def test_post_all_true_adds_every_session_without_chat_reads(self):
+        status, state = self.request("POST", {"expectedAccount": self.source.account, "all": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(state, {"account": self.source.account, "initialized": True,
+                                 "selectedSessions": ["contact-a", "group-a@chatroom"]})
+        self.assertEqual(self.source.session_calls, 1)
+        # The reserved shape is strict: all must be exactly True, and the account must match.
+        self.assertEqual(self.request("POST", {"expectedAccount": self.source.account,
+                                               "all": 1})[0], 400)
+        self.assertEqual(self.request("POST", {"expectedAccount": "another-account",
+                                               "all": True})[0], 503)
+
     def test_post_rejects_wrong_account_and_non_boolean_choice(self):
         self.assertEqual(self.request("POST", {"expectedAccount": "another-account",
                                                "session": "contact-a", "selected": True})[0], 503)

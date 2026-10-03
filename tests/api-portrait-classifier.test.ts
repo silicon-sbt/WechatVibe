@@ -73,7 +73,9 @@ it("ships all 59 exact local questions in one API call and never generates a sum
   for (const family of INTENT_FAMILIES) expected[`intent_group_${family.id}`] = groupQuestion(family.id);
   for (const group of INTENT_GROUPS) expected[`intent_detail_${group.id}`] = leafQuestion(group.id);
   assert.deepEqual(API_PORTRAIT_CLASSIFIER_QUESTIONS, expected);
-  assert.equal(Object.keys(expected).length, 59);
+  // This fork ships 60: `caring` replaces `affectionate` and `surprised` is split out of
+  // `amused`, so the emotion question carries eight broad buckets instead of upstream's seven.
+  assert.equal(Object.keys(expected).length, 60);
   let calls = 0, sent: GenerationRequest | undefined;
   const batch = request(Array.from({ length: 100 }, (_, index) => `合成文本${index}`));
   const result = await classifyApiPortraitBatch(config, batch, fake(ordinaryAnswers(), value => {
@@ -284,7 +286,7 @@ it("supplies both dominant-family leaves while safely ignoring the second family
 
 it("covers stable broad/group ties and excludes zero-probability branches", async () => {
   const full = allChoiceAnswers();
-  full.emotion = distribution("emotion", { happy: 0.5, affectionate: 0.5 });
+  full.emotion = distribution("emotion", { happy: 0.5, caring: 0.5 });
   full.intent = distribution("intent", { "small talk": 0.5, "share news": 0.5 });
   full.intent_group_small_talk = [0.5, 0.5, 0];
   full.intent_group_share_news = [0.5, 0.5];
@@ -298,7 +300,7 @@ it("covers stable broad/group ties and excludes zero-probability branches", asyn
   full.intent_group_small_talk = [1, 0, 0];
   supplied = topTwoAnswers(full);
   assert.equal(Object.keys(supplied).length, 17);
-  assert.equal(supplied.emotion_detail_affectionate, undefined);
+  assert.equal(supplied.emotion_detail_caring, undefined);
   assert.equal(supplied.intent_group_share_news, undefined);
   assert.equal(supplied.intent_detail_conversation, undefined);
   await classifyApiPortraitBatch(config, request(), fake(supplied));

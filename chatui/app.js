@@ -61,8 +61,8 @@ function getVisibleUnreadCount(session) {
   if (hasNewTime || hasNewPreview) return serverUnread;
   return 0;
 }
-const defaults = { theme: "dark", zoom: "1.0", intent: true };
-const CURRENT_LABEL_SCHEMA = "generic-v9";
+const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: true };
+const CURRENT_LABEL_SCHEMA = "generic-v10";
 const GENERIC_INTENT_LABELS = Object.freeze({
   small_talk: "闲聊", share_news: "分享", ask_question: "提问", seek_help: "求助", deny: "否认",
   give_comfort: "安慰", agree: "同意", invite: "邀约", show_affection: "表达好感",
@@ -98,11 +98,13 @@ delete settingsState.settings.historyLimit;
 if (!["dark", "light"].includes(settingsState.settings.theme)) settingsState.settings.theme = "dark";
 if (!["0.9", "1.0", "1.1", "1.25", "1.5"].includes(settingsState.settings.zoom)) settingsState.settings.zoom = "1.0";
 if (typeof settingsState.settings.intent !== "boolean") settingsState.settings.intent = true;
+if (typeof settingsState.settings.backgroundAnalyze !== "boolean") settingsState.settings.backgroundAnalyze = true;
 const save = () => localStorage.setItem("real-ui-settings-1", JSON.stringify(settingsState.settings));
 chatState.sessions = new Map();
 chatState.selectedConversations = new Set();
 chatState.selectionLoadedAccount = null;
 chatState.conversationSelectionBusy = false;
+chatState.allConversationsTracked = false;
 chatState.sessionCache = new Map();
 portraitState.profileCache = new Map();
 const sessionCacheMessageLimit = 80;
@@ -746,17 +748,209 @@ async function preloadSessionWindows(account, nextSessions, request) {
   }
   return true;
 }
+function validConversationSelection(state, account) {
+  return Boolean(state) && state.account === account && Array.isArray(state.selectedSessions) &&
+    state.selectedSessions.every(id => typeof id === "string");
+}
 async function loadConversationSelection(account, request) {
   if (chatState.selectionLoadedAccount === account) return;
-  const state = await api("/api/conversation-selection");
+  let state = await api("/api/conversation-selection");
   if (request !== chatState.sessionRequest || accountClearedExiting) return;
-  if (state?.account !== account || !Array.isArray(state.selectedSessions) ||
-      state.selectedSessions.some(id => typeof id !== "string"))
+  if (!validConversationSelection(state, account))
     throw new Error("Invalid conversation selection response");
+  if (state.initialized === false) {
+    // First launch for this account: put every conversation into the sidebar at once.
+    try {
+      const filled = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+        expectedAccount: account, all: true,
+      }) });
+      if (request !== chatState.sessionRequest || accountClearedExiting) return;
+      if (validConversationSelection(filled, account)) state = filled;
+    } catch { /* keep the empty selection and let the user add conversations manually */ }
+  }
   chatState.selectedConversations.clear();
   for (const id of state.selectedSessions) chatState.selectedConversations.add(id);
   chatState.selectionLoadedAccount = account;
 }
+// Once every conversation is in the sidebar, keep conversations that appear later
+// in sync, so a chat started afterwards does not silently stay out of the list.
+async function trackNewConversations(account) {
+  if (chatState.conversationSelectionBusy || !chatState.selectionLoadedAccount ||
+      account !== chatState.currentAccount) return;
+  if ([...chatState.sessions.keys()].every(id => chatState.selectedConversations.has(id))) return;
+  chatState.conversationSelectionBusy = true;
+  try {
+    const state = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+      expectedAccount: account, all: true,
+    }) });
+    if (account !== chatState.currentAccount || !validConversationSelection(state, account)) return;
+    chatState.selectedConversations.clear();
+    for (const id of state.selectedSessions) chatState.selectedConversations.add(id);
+    renderSessions();
+    if (!byId("conversationManager").hidden) renderConversationManager();
+  } catch { /* retry on the next session refresh */ }
+  finally { chatState.conversationSelectionBusy = false; }
+}
+async function addAllConversations() {
+  const account = chatState.currentAccount;
+  if (!account || chatState.conversationSelectionBusy || !chatState.selectionLoadedAccount ||
+      !chatState.sessions.size) return;
+  chatState.conversationSelectionBusy = true;
+  text("conversationManagerStatus", "正在添加全部会话…");
+  renderConversationManager();
+  try {
+    const state = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+      expectedAccount: account, all: true,
+    }) });
+    if (account !== chatState.currentAccount || !validConversationSelection(state, account))
+      throw new Error("选择结果不匹配");
+    chatState.selectedConversations.clear();
+    for (const id of state.selectedSessions) chatState.selectedConversations.add(id);
+    chatState.allConversationsTracked = true;
+    renderSessions();
+    text("conversationManagerStatus", "已添加 " + chatState.selectedConversations.size + " 个会话");
+    if (!chatState.currentUser) {
+      const first = [...chatState.sessions.keys()].find(id => chatState.selectedConversations.has(id));
+      if (first) switchSession(first);
+    }
+  } catch {
+    text("conversationManagerStatus", "操作失败，请重试");
+  } finally {
+    chatState.conversationSelectionBusy = false;
+    renderConversationManager();
+  }
+}
+
+// Local-model sweep: keep every selected conversation queued so the Laya analysis
+// keeps accumulating on this machine without opening each chat by hand.
+settingsState.sweepBusy = false;
+settingsState.overviewBusy = false;
+settingsState.analysisOverviewSnapshot = null;
+settingsState.workerSettings = null;
+async function backgroundAnalyzeAll() {
+  if (settingsState.sweepBusy || !settingsState.settings.backgroundAnalyze) return;
+  if (!canAnalyzeLocal() || !chatState.messageSourceReady || chatState.historyState ||
+      !chatState.selectionLoadedAccount ||
+      settingsState.suppressedLocalAccounts.has(chatState.currentAccount)) return;
+  const account = chatState.currentAccount;
+  settingsState.sweepBusy = true;
+  try {
+    // The visible conversation goes first: it is the one the user is reading.
+    const order = [...chatState.sessions.keys()];
+    if (chatState.currentUser && order.includes(chatState.currentUser)) {
+      order.splice(order.indexOf(chatState.currentUser), 1);
+      order.unshift(chatState.currentUser);
+    }
+    for (const id of order) {
+      if (!settingsState.settings.backgroundAnalyze || !canAnalyzeLocal() ||
+          account !== chatState.currentAccount) return;
+      if (!chatState.selectedConversations.has(id)) continue;
+      try {
+        // No per-conversation read here: the backend already knows the running job.
+        await api("/api/analyze", { method: "POST", body: JSON.stringify({
+          account, user: id, mode: "incremental",
+        }) });
+      } catch { /* one broken conversation must not stop the sweep */ }
+    }
+  } finally {
+    settingsState.sweepBusy = false;
+    void loadAnalysisOverview();
+  }
+}
+// Whole-account progress behind the sidebar bar: how many conversations the local
+// background sweep has walked to the end of their history.
+async function loadAnalysisOverview() {
+  if (settingsState.overviewBusy) return;
+  settingsState.overviewBusy = true;
+  try {
+    const data = await api("/api/analysis-overview");
+    if (data && typeof data.conversations === "number") {
+      settingsState.analysisOverviewSnapshot = data;
+      renderAnalysisOverview(data);
+    }
+  } catch { /* keep the last shown progress */ }
+  finally { settingsState.overviewBusy = false; }
+}
+function renderAnalysisOverview(data) {
+  const panel = byId("sweepProgress");
+  if (!data.conversations || !canAnalyzeLocal() || !settingsState.settings.backgroundAnalyze ||
+      !chatState.messageSourceReady) {
+    panel.hidden = true;
+    return;
+  }
+  const analyzed = Math.max(0, Number(data.analyzed) || 0);
+  const total = Math.max(0, Number(data.textTotal) || 0);
+  const percent = total > 0 ? Math.min(100, 100 * analyzed / total) : 0;
+  const complete = Math.max(0, Math.min(Number(data.complete) || 0, data.conversations));
+  panel.hidden = false;
+  byId("sweepProgressFill").style.width = percent.toFixed(2) + "%";
+  byId("sweepProgressValue").textContent =
+    percent >= 10 ? Math.floor(percent) + "%" : percent.toFixed(1) + "%";
+  const running = data.running ? chatState.sessions.get(data.running) : null;
+  byId("sweepProgressLabel").textContent =
+    running ? "后台分析 · " + (running.name || data.running) : "后台分析";
+  const details = ["已分析 " + analyzed + " / " + total + " 条文本（" + percent.toFixed(1) + "%）",
+    "完成 " + complete + " / " + data.conversations + " 个会话",
+    "已开始 " + (Number(data.scanned) || 0) + " 个"];
+  const workers = data.workers;
+  if (workers && Number(workers.max) > 1) {
+    details.push(workers.elastic ? "并行档位 " + workers.limit + " / " + workers.max + "（随负载自动调整）"
+      : "并行 " + workers.limit + " 路");
+  }
+  if (workers && typeof workers.gpu === "number") details.push("GPU " + Math.round(workers.gpu) + "%");
+  if (workers && typeof workers.gpuFreeMiB === "number") {
+    details.push("可用显存 " + (workers.gpuFreeMiB / 1024).toFixed(1) + " GB");
+  }
+  if (workers && typeof workers.cpu === "number") details.push("CPU " + Math.round(workers.cpu) + "%");
+  panel.title = details.join(" · ");
+}
+// How many model processes run the local analysis; the bridge owns the pool and the
+// load monitor, this row only mirrors and edits the saved ceiling.
+async function loadWorkerSettings() {
+  try {
+    settingsState.workerSettings = await api("/api/analysis-workers");
+  } catch {
+    settingsState.workerSettings = null;
+  }
+  renderWorkerSettings();
+}
+function renderWorkerSettings() {
+  const hint = byId("workerLimitHint");
+  const row = hint.parentElement;
+  const settings = settingsState.workerSettings;
+  if (!settings) {
+    byId("workerLimitValue").textContent = "—";
+    row.classList.remove("show");
+    return;
+  }
+  byId("workerLimitValue").textContent = String(settings.workers);
+  byId("btnWorkerMinus").disabled = settings.workers <= 1;
+  byId("btnWorkerPlus").disabled = settings.workers >= (settings.max || 4);
+  const elastic = byId("btnToggleElasticWorkers");
+  elastic.textContent = settings.elastic ? "跟随负载" : "固定档位";
+  elastic.classList.toggle("active", !!settings.elastic);
+  elastic.setAttribute("aria-pressed", String(!!settings.elastic));
+  row.classList.add("show");
+  const live = settings.elastic && Number(settings.max) > 1
+    ? "当前 " + settings.limit + " / " + settings.workers + " 路（负载高时自动降档）"
+    : "固定 " + settings.workers + " 路并行";
+  hint.textContent = (Number(settings.workers) > 1
+    ? "越多越快、也越占 CPU 和显存；" : "单路最省资源；") + live + "。";
+}
+async function changeWorkerSettings(delta, elastic) {
+  const current = settingsState.workerSettings;
+  if (!current) return;
+  const max = current.max || 4;
+  const workers = Math.max(1, Math.min(max, (Number(current.workers) || 1) + delta));
+  try {
+    settingsState.workerSettings = await api("/api/analysis-workers", { method: "POST",
+      body: JSON.stringify({ workers, elastic: elastic === undefined ? !!current.elastic : elastic }) });
+  } catch {
+    return;
+  }
+  renderWorkerSettings();
+}
+
 function clearUnselectedConversation() {
   if (chatState.currentUser) {
     cacheCurrentSession({ messages: chatState.messages, results: labelState.results, mood: chatState.conversationMood,
@@ -964,6 +1158,10 @@ async function loadSessions(retryChanged = true) {
     renderSessions();
     if (!byId("conversationManager").hidden) renderConversationManager();
     byId("sessionList").scrollTop = scroll;
+    if (!chatState.allConversationsTracked && chatState.sessions.size &&
+        [...chatState.sessions.keys()].every(id => chatState.selectedConversations.has(id)))
+      chatState.allConversationsTracked = true;
+    if (chatState.allConversationsTracked) void trackNewConversations(data.account);
     if (!await preloadSessionWindows(data.account, nextSessions, request)) return;
     if (request !== chatState.sessionRequest || chatState.currentAccount !== data.account) return;
     let remembered = null;
@@ -1071,7 +1269,9 @@ function hasIntentContent(messageText) {
   return String(messageText || "").trim().length > 0;
 }
 function isIncompleteFragment(messageText) {
-  return /^(?:这|那|我|你|你这|这个|那个)(?:就)?是[，,。！!…\s]*$/u.test(String(messageText || "").trim());
+  // A dangling copula ("我是" / "这是" / "我这是") states nothing a label could
+  // stand on, so the whole label row stays blank for it.
+  return /^(?:这|那|我|你|你这|这个|那个)(?:就|这|那)?是[，,。！!…\s]*$/u.test(String(messageText || "").trim());
 }
 // Plain acknowledgements / status reports display blank unless the text turns or asks for
 // something. This is an explicit short-text rule, not a global label blacklist: a normal
@@ -1204,6 +1404,9 @@ function updateLabel(message, node) {
     wrap.appendChild(row);
   }
 }
+// One hint per session: the bridge derives the image key the first time it is asked for a
+// picture, and that scan only succeeds while WeChat itself is showing an image.
+let imageKeyHintShown = false;
 function messageNode(message) {
   const session = chatState.sessions.get(chatState.currentUser);
   const item = element("div", `msg-item ${message.side === "self" ? "outgoing" : "incoming"}`);
@@ -1213,8 +1416,40 @@ function messageNode(message) {
   item.appendChild(avatarColumn);
   const wrap = element("div", "msg-content-wrap");
   if (session?.isGroup && message.side !== "self") wrap.appendChild(element("span", "msg-sender", message.senderName || message.senderId || "未知成员"));
-  wrap.appendChild(element("div", "msg-bubble", message.kind === "image" ? "[图片]" :
-    message.kind === "text" ? message.text || "" : message.text || "[不支持的消息]"));
+  if (message.kind === "image") {
+    // Images are decrypted on demand by the local bridge, so the bubble shows the picture
+    // itself and only falls back to the placeholder when it cannot be read.
+    const image = document.createElement("img");
+    image.className = "msg-image";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.alt = "图片";
+    image.src = "/api/media?user=" + encodeURIComponent(chatState.currentUser) +
+      "&id=" + encodeURIComponent(message.id);
+    image.addEventListener("click", () => image.classList.toggle("zoomed"));
+    // The bridge may still be deriving the image key, so retry a few times before the
+    // placeholder takes over.
+    let attempts = 0;
+    image.addEventListener("error", () => {
+      if (++attempts <= 6) {
+        setTimeout(() => {
+          const base = "/api/media?user=" + encodeURIComponent(chatState.currentUser) +
+            "&id=" + encodeURIComponent(message.id);
+          image.src = base + "&retry=" + attempts;
+        }, 20000);
+        return;
+      }
+      image.replaceWith(element("div", "msg-bubble", "[图片]"));
+      if (!imageKeyHintShown) {
+        imageKeyHintShown = true;
+        toast("首次显示图片需要在微信里点开任意一张图片（用于获取解密密钥），之后会自动显示");
+      }
+    });
+    wrap.appendChild(image);
+  } else {
+    wrap.appendChild(element("div", "msg-bubble",
+      message.kind === "text" ? message.text || "" : message.text || "[不支持的消息]"));
+  }
   item.appendChild(wrap);
   updateLabel(message, item);
   return item;
@@ -1748,6 +1983,27 @@ function scheduleIncremental(user, token, signal, data, changed, signature) {
   state.requestedSignature = signature;
   void startIncremental(user, token, signal, key, state);
 }
+// Poll the analysis read a few times right after a label pass is requested, so a new
+// message shows its labels as soon as the cheap read has them.
+let labelFollowUpTimer = null;
+let labelFollowUpTries = 0;
+function followUpLabels(user, token, signal) {
+  clearTimeout(labelFollowUpTimer);
+  labelFollowUpTries = 0;
+  const tick = async () => {
+    labelFollowUpTimer = null;
+    if (token !== chatState.generation || user !== chatState.currentUser || chatState.historyState ||
+        document.hidden || !canAnalyzeLocal()) return;
+    if (!uncoveredMessages().length) return;
+    await loadAnalysis(user, token, signal);
+    if (token !== chatState.generation || user !== chatState.currentUser || chatState.historyState) return;
+    if (!uncoveredMessages().length) return;
+    if (++labelFollowUpTries < 10) {
+      labelFollowUpTimer = setTimeout(tick, labelFollowUpTries < 4 ? 1500 : 4000);
+    }
+  };
+  labelFollowUpTimer = setTimeout(tick, 1200);
+}
 async function loadAnalysis(user, token, signal) {
   if (chatState.historyState || !canAnalyzeLocal()) return;
   const request = ++portraitState.analysisGeneration;
@@ -1799,6 +2055,10 @@ async function analyzeRecent(user, token, signal, signature, limit, window) {
       labelState.inlineIntentJobId = data.job?.recent?.id || null;
       renderJob(data.job, false);
       await loadAnalysis(user, token, signal);
+      // The label pass runs in the background, so labels for a brand-new message only
+      // appear on a later read. Follow the window briefly instead of waiting for the
+      // next user action.
+      followUpLabels(user, token, signal);
     }
   } catch (error) {
     if (error.name !== "AbortError" && token === chatState.generation && canAnalyzeLocal()) {
@@ -3142,6 +3402,10 @@ function applySettings() {
   byId("selectZoomLevel").value = settingsState.settings.zoom;
   byId("btnToggleIntent").classList.toggle("active", settingsState.settings.intent);
   byId("btnToggleIntent").setAttribute("aria-pressed", String(settingsState.settings.intent));
+  byId("btnToggleBackgroundAnalyze").classList.toggle("active", settingsState.settings.backgroundAnalyze);
+  byId("btnToggleBackgroundAnalyze").setAttribute("aria-pressed", String(settingsState.settings.backgroundAnalyze));
+  byId("btnToggleBackgroundAnalyze").textContent = settingsState.settings.backgroundAnalyze ? "已开启" : "已关闭";
+  if (settingsState.analysisOverviewSnapshot) renderAnalysisOverview(settingsState.analysisOverviewSnapshot);
   refreshLabels();
 }
 settingsState.runtimeSnapshot = null;
@@ -4555,6 +4819,32 @@ byId("chatMessages").addEventListener("scroll", event => {
 });
 byId("btnHistoryEarlier").addEventListener("click", () => void loadOlderHistory());
 byId("btnHistoryNewer").addEventListener("click", () => void loadNewerHistory());
+let refreshBusy = false;
+async function manualRefresh() {
+  if (refreshBusy) return;
+  refreshBusy = true;
+  const button = byId("btnRefresh");
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = "刷新中…";
+  try {
+    if (!chatState.historyState && chatState.currentUser)
+      await loadMessages(chatState.generation, true, true);
+    await loadSessions();
+    if (chatState.currentUser && chatState.view === "persona") await loadProfile(portraitState.activeMember);
+    else if (chatState.currentUser)
+      await loadAnalysis(chatState.currentUser, chatState.generation, chatState.controller?.signal);
+    if (settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api" &&
+        settingsState.settings.intent) ensureApiInsights(true);
+    void loadAnalysisOverview();
+  } catch { /* the per-path status text already reports the failure */ }
+  finally {
+    button.textContent = label;
+    button.disabled = false;
+    refreshBusy = false;
+  }
+}
+byId("btnRefresh").addEventListener("click", () => { void manualRefresh(); });
 byId("btnReturnLatest").addEventListener("click", returnToLatest);
 byId("btnChatHistory").addEventListener("click", () => byId("historySearchPanel").hidden ? openHistorySearch() : closeHistorySearch());
 byId("btnCloseHistorySearch").addEventListener("click", closeHistorySearch);
@@ -4899,6 +5189,18 @@ byId("btnManageConversations").addEventListener("click", () => {
   else closeConversationManager();
 });
 byId("conversationSearch").addEventListener("input", renderConversationManager);
+byId("btnAddAllConversations").addEventListener("click", () => { void addAllConversations(); });
+byId("btnToggleBackgroundAnalyze").addEventListener("click", () => {
+  settingsState.settings.backgroundAnalyze = !settingsState.settings.backgroundAnalyze;
+  save();
+  applySettings();
+  if (settingsState.settings.backgroundAnalyze) void backgroundAnalyzeAll();
+});
+byId("btnWorkerMinus").addEventListener("click", () => { void changeWorkerSettings(-1); });
+byId("btnWorkerPlus").addEventListener("click", () => { void changeWorkerSettings(1); });
+byId("btnToggleElasticWorkers").addEventListener("click", () => {
+  void changeWorkerSettings(0, !settingsState.workerSettings?.elastic);
+});
 byId("btnCloseSettings").addEventListener("click", closeSettingsModal);
 byId("settingsModal").addEventListener("click", event => { if (event.target === byId("settingsModal")) closeSettingsModal(); });
 byId("btnManageAccounts").addEventListener("click", () => {
@@ -5096,6 +5398,11 @@ window.addEventListener("wechatvibe-service-restored", () => {
 if (!updateValidationMode) {
   setInterval(() => { if (updateCommitReady && chatState.currentUser && !document.hidden) loadMessages(chatState.generation, true); }, 4000);
   setInterval(() => { if (updateCommitReady && !document.hidden) loadSessions(); }, 15000);
+  setTimeout(() => { if (updateCommitReady) void backgroundAnalyzeAll(); }, 20000);
+  setInterval(() => { if (updateCommitReady) void backgroundAnalyzeAll(); }, 600000);
+  setTimeout(() => { if (updateCommitReady) void loadAnalysisOverview(); }, 8000);
+  setInterval(() => { if (updateCommitReady && !document.hidden) void loadAnalysisOverview(); }, 60000);
+  setTimeout(() => { if (updateCommitReady) void loadWorkerSettings(); }, 9000);
 }
 document.addEventListener("visibilitychange", () => {
   if (document.hidden || updateValidationMode || !updateCommitReady) return;

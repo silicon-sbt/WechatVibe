@@ -79,6 +79,20 @@ class ConversationSelectionStoreTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(self.store.get(self.account_a)["selectedSessions"]), 12)
 
+    def test_set_all_selected_adds_every_known_session_once(self):
+        state = self.store.set_all_selected(self.account_a, ["contact-a", "group-a@chatroom"])
+        self.assertEqual(state, {"account": self.account_a, "initialized": True,
+                                 "selectedSessions": ["contact-a", "group-a@chatroom"]})
+        # Idempotent, and a later sweep never drops an earlier choice.
+        again = self.store.set_all_selected(self.account_a, ["contact-a", "contact-b"])
+        self.assertEqual(again["selectedSessions"],
+                         ["contact-a", "contact-b", "group-a@chatroom"])
+        # Every id is validated before a single row is written.
+        with self.assertRaises(ValueError):
+            self.store.set_all_selected(self.account_a, ["contact-c", "bad\x00session"])
+        self.assertEqual(self.store.get(self.account_a)["selectedSessions"],
+                         ["contact-a", "contact-b", "group-a@chatroom"])
+
     def test_invalid_scope_and_incomplete_schema_are_rejected(self):
         for account, session, selected in (("../other", "contact", True),
                                            (self.account_a, "", True),

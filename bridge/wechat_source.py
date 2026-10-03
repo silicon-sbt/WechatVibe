@@ -25,6 +25,25 @@ from backend_contracts import (
 from history_browser import encode_cursor
 
 
+# Official accounts, service notifications and fold placeholders carry no conversation
+# worth analysing or listing, so a whole-account sidebar leaves them out. Real contacts,
+# group chats and filehelper/openim are kept.
+SERVICE_ACCOUNT_IDS = frozenset({
+    "brandsessionholder", "brandservicesessionholder", "notifymessage", "weixin",
+    "opencustomerservicemsg", "newsapp", "weixinliteservice", "weixinreminder",
+    "fmessage", "floatbottle", "medianote", "qqmail", "voiceinput", "exmail_tool",
+})
+SERVICE_ACCOUNT_SUFFIXES = frozenset({"placeholder_foldgroup", "weclaw", "kefu.openim"})
+
+
+def is_service_account(user):
+    """Official accounts and system rows are not conversations."""
+    if user.startswith("gh_"):
+        return True
+    base, _, suffix = user.partition("@")
+    return base.lower() in SERVICE_ACCOUNT_IDS or suffix.lower() in SERVICE_ACCOUNT_SUFFIXES
+
+
 def active_account_dir():
     """Resolve a unique live account from WeChat's open-file metadata, never DB mtimes."""
     native_reader = str(ROOT / "native-reader")
@@ -115,6 +134,10 @@ class WeChatSource:
         self._self_username = None
         self.issued_images = OrderedDict()
         self.window_images = {}
+        # The image AES key is not one of the database keys we hold, so it is derived once
+        # by a background scan and then cached on disk by the reader.
+        self.image_key_lock = threading.Lock()
+        self.image_key_scan = {"running": False, "retry_at": 0.0}
         self.profile_metadata_cache = OrderedDict()
         self.profile_overview_counts_cache = OrderedDict()
         self.media_reason = threading.local()
@@ -381,7 +404,7 @@ class WeChatSource:
                                         "ORDER BY sort_timestamp DESC,rowid DESC")
                     while batch := rows.fetchmany(256):
                         for user, unread, summary, last_time, sender, sender_name, sort_time, message_type, sub_type, is_top in batch:
-                            if not isinstance(user, str) or not user:
+                            if not isinstance(user, str) or not user or is_service_account(user):
                                 continue
                             contact = contact_display(contacts, user)
                             try:
@@ -634,6 +657,46 @@ class WeChatSource:
                 raise AccountChangedError()
             return texts
 
+    def _start_image_key_scan(self, db):
+        """Derive the image AES key once, off the request path.
+
+        The reader holds the database keys only; the image key is either derived from the
+        WeChat config dword or scanned out of Weixin.exe, which can take a minute. The scan
+        runs in the background and persists its result, so later reads are immediate.
+        """
+        # An injected factory means a synthetic reader: never scan the real WeChat process
+        # for it, and keep the deterministic failure the tests rely on.
+        if self.media_factory is not None:
+            return False
+        now = time.monotonic()
+        with self.image_key_lock:
+            if self.image_key_scan["running"] or now < self.image_key_scan["retry_at"]:
+                return self.image_key_scan["running"]
+            self.image_key_scan["running"] = True
+
+        def worker():
+            found = None
+            try:
+                from wechatauto.media import MediaDownloader
+                downloader = MediaDownloader(db)
+                # A short, bounded scan: the reader's own default keeps reading Weixin.exe
+                # for 120 seconds, which is heavy enough to make the desktop client stutter.
+                key = downloader._scan_aes_key(monitor=True, monitor_timeout=20)
+                if key:
+                    downloader._persist_key(key)
+                    found = (key, downloader._xor_key)
+            except Exception:
+                found = None
+            finally:
+                with self.image_key_lock:
+                    self.image_key_scan["running"] = False
+                    if not found:
+                        # Retry later: WeChat may have been restarted since the last attempt.
+                        self.image_key_scan["retry_at"] = time.monotonic() + 600
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
     def media(self, user, stable_id):
         self.require_messages_ready()
         self.media_reason.value = None
@@ -705,6 +768,8 @@ class WeChatSource:
                 else:
                     aes_key = downloader._load_persisted_key()
                     if not aes_key:
+                        if self._start_image_key_scan(db):
+                            return unavailable("local-key-pending")
                         return unavailable("local-key-unavailable")
                     xor_key = downloader._derive_xor_key(dat_path)
             data = downloader.decrypt_image(dat_path, aes_key=aes_key, xor_key=xor_key)
@@ -943,6 +1008,42 @@ class WeChatSource:
                     conn.close()
             return count, text_count, [{"id": member, **contact_display(contacts, member)}
                                        for member in sorted(members)]
+
+    def target_text_totals(self, users):
+        """Messages the portrait scan can consume, per conversation.
+
+        Same predicate as _analyzable_counts (plain text plus quoted replies) but without the
+        per-row classification, which is what made a whole-account inventory expensive: these
+        are plain SQL counts, milliseconds per conversation.
+        """
+        self.require_messages_ready()
+        with self.lock:
+            db = self._db()
+            own = self.self_user(db)
+            totals = {}
+            for user in users:
+                found = db._msg_conns(user)
+                total = 0
+                try:
+                    for conn, table in found:
+                        if not re.fullmatch(r"Msg_[0-9a-fA-F]{32}", table):
+                            raise RuntimeError("invalid message table")
+                        senders = {int(row[0]): row[1] for row in
+                                   conn.execute("SELECT rowid,user_name FROM Name2Id")}
+                        ids = [sender_id for sender_id, name in senders.items()
+                               if name and name != own]
+                        if not ids:
+                            continue
+                        placeholders = ",".join("?" for _ in ids)
+                        total += conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE local_type IN (?,?) "
+                            f"AND real_sender_id IN ({placeholders})",
+                            (1, QUOTED_REPLY_TYPE, *ids)).fetchone()[0]
+                finally:
+                    for conn in {id(conn): conn for conn, _ in found}.values():
+                        conn.close()
+                totals[user] = total
+            return totals
 
     def profile_metadata(self, user, member=None):
         """Read metadata once per snapshot revision; Backend brackets the account scope."""
