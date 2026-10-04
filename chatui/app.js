@@ -62,7 +62,7 @@ function getVisibleUnreadCount(session) {
   return 0;
 }
 const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: false };
-const CURRENT_LABEL_SCHEMA = "generic-v9";
+const CURRENT_LABEL_SCHEMA = "generic-v10";
 const GENERIC_INTENT_LABELS = Object.freeze({
   small_talk: "闲聊", share_news: "分享", ask_question: "提问", seek_help: "求助", deny: "否认",
   give_comfort: "安慰", agree: "同意", invite: "邀约", show_affection: "表达好感",
@@ -1306,7 +1306,9 @@ function hasIntentContent(messageText) {
   return String(messageText || "").trim().length > 0;
 }
 function isIncompleteFragment(messageText) {
-  return /^(?:这|那|我|你|你这|这个|那个)(?:就)?是[，,。！!…\s]*$/u.test(String(messageText || "").trim());
+  // A dangling copula ("我是" / "这是" / "我这是") states nothing a label could
+  // stand on, so the whole label row stays blank for it.
+  return /^(?:这|那|我|你|你这|这个|那个)(?:就|这|那)?是[，,。！!…\s]*$/u.test(String(messageText || "").trim());
 }
 // Plain acknowledgements / status reports display blank unless the text turns or asks for
 // something. This is an explicit short-text rule, not a global label blacklist: a normal
@@ -1439,6 +1441,9 @@ function updateLabel(message, node) {
     wrap.appendChild(row);
   }
 }
+// One hint per session: the bridge derives the image key the first time it is asked for a
+// picture, and that scan only succeeds while WeChat itself is showing an image.
+let imageKeyHintShown = false;
 function messageNode(message) {
   const session = chatState.sessions.get(chatState.currentUser);
   const item = element("div", `msg-item ${message.side === "self" ? "outgoing" : "incoming"}`);
@@ -1448,8 +1453,40 @@ function messageNode(message) {
   item.appendChild(avatarColumn);
   const wrap = element("div", "msg-content-wrap");
   if (session?.isGroup && message.side !== "self") wrap.appendChild(element("span", "msg-sender", message.senderName || message.senderId || "未知成员"));
-  wrap.appendChild(element("div", "msg-bubble", message.kind === "image" ? "[图片]" :
-    message.kind === "text" ? message.text || "" : message.text || "[不支持的消息]"));
+  if (message.kind === "image") {
+    // Images are decrypted on demand by the local bridge, so the bubble shows the picture
+    // itself and only falls back to the placeholder when it cannot be read.
+    const image = document.createElement("img");
+    image.className = "msg-image";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.alt = "图片";
+    image.src = "/api/media?user=" + encodeURIComponent(chatState.currentUser) +
+      "&id=" + encodeURIComponent(message.id);
+    image.addEventListener("click", () => image.classList.toggle("zoomed"));
+    // The bridge may still be deriving the image key, so retry a few times before the
+    // placeholder takes over.
+    let attempts = 0;
+    image.addEventListener("error", () => {
+      if (++attempts <= 6) {
+        setTimeout(() => {
+          const base = "/api/media?user=" + encodeURIComponent(chatState.currentUser) +
+            "&id=" + encodeURIComponent(message.id);
+          image.src = base + "&retry=" + attempts;
+        }, 20000);
+        return;
+      }
+      image.replaceWith(element("div", "msg-bubble", "[图片]"));
+      if (!imageKeyHintShown) {
+        imageKeyHintShown = true;
+        toast("首次显示图片需要在微信里点开任意一张图片（用于获取解密密钥），之后会自动显示");
+      }
+    });
+    wrap.appendChild(image);
+  } else {
+    wrap.appendChild(element("div", "msg-bubble",
+      message.kind === "text" ? message.text || "" : message.text || "[不支持的消息]"));
+  }
   item.appendChild(wrap);
   updateLabel(message, item);
   return item;
@@ -1983,6 +2020,27 @@ function scheduleIncremental(user, token, signal, data, changed, signature) {
   state.requestedSignature = signature;
   void startIncremental(user, token, signal, key, state);
 }
+// Poll the analysis read a few times right after a label pass is requested, so a new
+// message shows its labels as soon as the cheap read has them.
+let labelFollowUpTimer = null;
+let labelFollowUpTries = 0;
+function followUpLabels(user, token, signal) {
+  clearTimeout(labelFollowUpTimer);
+  labelFollowUpTries = 0;
+  const tick = async () => {
+    labelFollowUpTimer = null;
+    if (token !== chatState.generation || user !== chatState.currentUser || chatState.historyState ||
+        document.hidden || !canAnalyzeLocal()) return;
+    if (!uncoveredMessages().length) return;
+    await loadAnalysis(user, token, signal);
+    if (token !== chatState.generation || user !== chatState.currentUser || chatState.historyState) return;
+    if (!uncoveredMessages().length) return;
+    if (++labelFollowUpTries < 10) {
+      labelFollowUpTimer = setTimeout(tick, labelFollowUpTries < 4 ? 1500 : 4000);
+    }
+  };
+  labelFollowUpTimer = setTimeout(tick, 1200);
+}
 async function loadAnalysis(user, token, signal) {
   if (chatState.historyState || !canAnalyzeLocal()) return;
   const request = ++portraitState.analysisGeneration;
@@ -2034,6 +2092,10 @@ async function analyzeRecent(user, token, signal, signature, limit, window) {
       labelState.inlineIntentJobId = data.job?.recent?.id || null;
       renderJob(data.job, false);
       await loadAnalysis(user, token, signal);
+      // The label pass runs in the background, so labels for a brand-new message only
+      // appear on a later read. Follow the window briefly instead of waiting for the
+      // next user action.
+      followUpLabels(user, token, signal);
     }
   } catch (error) {
     if (error.name !== "AbortError" && token === chatState.generation && canAnalyzeLocal()) {
@@ -4795,6 +4857,32 @@ byId("chatMessages").addEventListener("scroll", event => {
   }
 });
 byId("btnHistoryEarlier").addEventListener("click", () => void loadOlderHistory());
+let refreshBusy = false;
+async function manualRefresh() {
+  if (refreshBusy) return;
+  refreshBusy = true;
+  const button = byId("btnRefresh");
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = "刷新中…";
+  try {
+    if (!chatState.historyState && chatState.currentUser)
+      await loadMessages(chatState.generation, true, true);
+    await loadSessions();
+    if (chatState.currentUser && chatState.view === "persona") await loadProfile(portraitState.activeMember);
+    else if (chatState.currentUser)
+      await loadAnalysis(chatState.currentUser, chatState.generation, chatState.controller?.signal);
+    if (settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api" &&
+        settingsState.settings.intent) ensureApiInsights(true);
+    void loadAnalysisOverview();
+  } catch { /* the per-path status text already reports the failure */ }
+  finally {
+    button.textContent = label;
+    button.disabled = false;
+    refreshBusy = false;
+  }
+}
+byId("btnRefresh").addEventListener("click", () => { void manualRefresh(); });
 byId("btnHistoryNewer").addEventListener("click", () => void loadNewerHistory());
 byId("btnReturnLatest").addEventListener("click", returnToLatest);
 byId("btnChatHistory").addEventListener("click", () => byId("historySearchPanel").hidden ? openHistorySearch() : closeHistorySearch());
