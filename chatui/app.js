@@ -1302,6 +1302,13 @@ function labelOptionLimit() {
   const value = Number(settingsState.settings?.labelOptions);
   return Number.isInteger(value) && value >= 1 && value <= 3 ? value : 1;
 }
+// The setting explains itself in one line, because "1 / 2 / 3" alone does not say what
+// changes. Only the local model path produces ranked candidates, so the hint says so.
+function labelOptionsHintText(limit) {
+  return limit <= 1
+    ? "默认：每条消息只显示 1 个标签，与旧版一致；第一名与第二名接近时整行不显示（仅本地分析生效）"
+    : `显示概率最高的前 ${limit} 个候选，各带百分比；与第一名接近的候选会标「相近」（仅本地分析生效）`;
+}
 function markCloseCandidates(entries) {
   const top = entries[0];
   if (!top || typeof top.probability !== "number") return entries;
@@ -3482,8 +3489,12 @@ function applySettings() {
     const node = byId(`btnLabelOptions${count}`);
     node.classList.toggle("active", labelOptions === count);
     node.setAttribute("aria-pressed", String(labelOptions === count));
-    node.title = `显示概率最高的前 ${count} 个候选项（本地分析）`;
+    node.setAttribute("aria-label", count === 1 ? "只显示 1 个标签" : `显示概率最高的前 ${count} 个候选`);
+    node.title = count === 1
+      ? "只显示 1 个标签，与旧版一致"
+      : `显示概率最高的前 ${count} 个候选，并标注与第一名接近的候选`;
   }
+  byId("labelOptionsHint").textContent = labelOptionsHintText(labelOptions);
   if (settingsState.analysisOverviewSnapshot) renderAnalysisOverview(settingsState.analysisOverviewSnapshot);
   refreshLabels();
 }

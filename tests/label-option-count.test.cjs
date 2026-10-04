@@ -33,7 +33,8 @@ vm.runInContext(
   section("const LABEL_OPTION_FLOOR", "function hasIntentContent(") +
   section("function hasIntentContent(", "function clearInlineIntentPending(") +
   "globalThis.api = { displayedEmotion, displayedIntent, rankedEmotionScores, hasIntentContent," +
-  " isIncompleteFragment, render: messageLabelsApi().render, localView: window.MessageInsightAdapters.localView };",
+  " isIncompleteFragment, labelOptionsHintText, render: messageLabelsApi().render," +
+  " localView: window.MessageInsightAdapters.localView };",
   context);
 const api = context.api;
 const labels = entries => Array.from(entries, entry => entry.item.label);
@@ -136,9 +137,29 @@ it("ships the setting, its default and the reader-facing entry", () => {
   const html = readFileSync(path.join(root, "chatui/index.html"), "utf8");
   for (const id of ["btnLabelOptions1", "btnLabelOptions2", "btnLabelOptions3"]) {
     assert.ok(html.includes(`id="${id}"`), `index.html must ship #${id}`);
+    assert.match(html, new RegExp(`id="${id}"[^>]*aria-label=`, "u"), `#${id} needs an accessible name`);
   }
   assert.match(source, /labelOptions: 1 \};/u);
   assert.match(source, /optionCount: labelOptionLimit\(\)/u);
   assert.match(source, /settingsState\.settings\.labelOptions, result\.labelSchema/u);
   assert.match(source, /element, percent,/u);
+  // The row explains itself, and the selected choice must be visible without hovering.
+  const localStart = html.indexOf('id="localModelSettings"');
+  const local = html.slice(localStart, html.indexOf("</section>", localStart));
+  assert.ok(local.includes('id="labelOptionsHint"'), "the hint belongs with the local-only settings");
+  const css = readFileSync(path.join(root, "chatui/style.css"), "utf8");
+  assert.match(css, /\.settings-action-btn\.active \{/u);
+  assert.match(css, /#localModelSettings \.label-options-hint/u);
+  assert.match(source, /byId\("labelOptionsHint"\)\.textContent = labelOptionsHintText\(/u);
+});
+
+it("tells the reader what the chosen option count does", () => {
+  assert.match(api.labelOptionsHintText(1), /只显示 1 个标签/u);
+  assert.match(api.labelOptionsHintText(1), /接近时整行不显示/u);
+  assert.match(api.labelOptionsHintText(2), /前 2 个候选/u);
+  assert.match(api.labelOptionsHintText(3), /前 3 个候选/u);
+  assert.match(api.labelOptionsHintText(3), /「相近」/u);
+  for (const limit of [1, 2, 3]) {
+    assert.match(api.labelOptionsHintText(limit), /仅本地分析生效/u, "the hint says where the setting applies");
+  }
 });
