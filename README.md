@@ -19,6 +19,7 @@
 | [#21](https://github.com/tswawa/WechatVibe/pull/21) | 后台分析全部会话的开关、侧栏总进度与并行档位 | **已合并**（`fcdd150`；上游改成默认关闭，并修了进度显示） |
 | [#17](https://github.com/tswawa/WechatVibe/pull/17) | 消息内嵌图片直接显示（点击放大） | 开放；上游表示改动面较大、后续自己做，本 fork 保留该功能 |
 | [#22](https://github.com/tswawa/WechatVibe/pull/22) | 单条消息右键「重新生成测评」（只重算这一条并覆盖已保存结果） | 开放；本 fork 已并入 `main` |
+| [#23](https://github.com/tswawa/WechatVibe/pull/23) | 每条消息显示选项数 1 / 2 / 3（默认 1 与现状一致；本地路径显示前 N 个候选 + 概率 + 「相近」标注，只影响本地模型） | 开放；本 fork 已并入 `main` |
 
 **#13 的采纳情况**（上游在 1.2.3 里手工移植）：
 
@@ -71,6 +72,7 @@ v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github
 | `selfuse/v1.2.0` | v1.2.0 + 旧的原始自用补丁（存档，不再维护） |
 | `feat/inline-image` | PR #17 消息内嵌图片（已并入 `main`，PR 仍开放） |
 | `feat/message-regenerate` | PR #22 单条消息重新生成（已并入 `main`，PR 开放） |
+| `feat/label-option-count` | PR #23 每条消息显示选项数（已并入 `main`，PR 开放） |
 | `feat/parallel-analysis-workers` | PR #10（已合并，可归档） |
 | `fix/emotion-question-options` | PR #13（已合并，可归档） |
 | `feat/service-account-filter` | PR #18（已合并，可归档） |
