@@ -2039,6 +2039,14 @@ body.theme-light .kaomoji-mood {
 .intent-item .intent-pct {
   color: #77777a;
 }
+.intent-close {
+  padding: 0 3px;
+  border: 1px solid #4a4a4d;
+  border-radius: 3px;
+  color: #8a8a8d;
+  font-size: 10px;
+  line-height: 14px;
+}
 
 /* Toolbar Text Buttons (意图识别 / 人物画像) */
 .toolbar-text-btn {
