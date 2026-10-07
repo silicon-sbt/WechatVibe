@@ -71,7 +71,7 @@ v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github
 | 分支 | 内容 | 上游状态 |
 | --- | --- | --- |
 | [`fix/state-tail-keyerror`](https://github.com/silicon-sbt/WechatVibe/tree/fix/state-tail-keyerror) | 修 [#24](https://github.com/tswawa/WechatVibe/issues/24) 的三处 `KeyError`（`batch_state.py` / `profile_state.py` / `result_store.py`）：进度被清、明细还在时不再整轮失败，健康状态数值逐字节不变 | [PR #31](https://github.com/tswawa/WechatVibe/pull/31) 开放 |
-| [`fix/key-scan-budget`](https://github.com/silicon-sbt/WechatVibe/tree/fix/key-scan-budget) | 修 [#30](https://github.com/tswawa/WechatVibe/issues/30)：config cipher 扫描预算从 2 GiB / 4 GiB 提到 4 GiB / 8 GiB，微信进程内存涨大后不再「账号永远未就绪」 | 未开 PR —— 留给 issue 作者提，避免撞车 |
+| [`fix/key-scan-budget`](https://github.com/silicon-sbt/WechatVibe/tree/fix/key-scan-budget) | 修 [#30](https://github.com/tswawa/WechatVibe/issues/30)：config cipher 扫描预算从 2 GiB / 4 GiB 提到 4 GiB / 8 GiB，微信进程内存涨大后不再「账号永远未就绪」 | 上游由 issue 作者提了 [#32](https://github.com/tswawa/WechatVibe/pull/32)（与本分支等价、只差注释，**只合一个**）；本分支保留作备用 |
 
 用法：`git clone -b <分支> https://github.com/silicon-sbt/WechatVibe.git`，然后按上游 README 构建。两个修复也都已经打在本机现役安装目录里验证过（bridge `result=ready required=5 matched=5`、`/api/health state=ready`）。
 
@@ -94,7 +94,7 @@ v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github
 | `feat/analysis-overview` | PR #20（已合并，可归档） |
 | `feat/background-sweep-ui` | PR #21（已合并，可归档） |
 | `fix/state-tail-keyerror` | PR #31（基于上游 main 的单提交，可单独构建） |
-| `fix/key-scan-budget` | #30 的扫描预算修复（基于上游 main 的单提交，未开 PR） |
+| `fix/key-scan-budget` | #30 的扫描预算修复（基于上游 main 的单提交；上游等价 PR [#32](https://github.com/tswawa/WechatVibe/pull/32)） |
 
 ## 许可
 
