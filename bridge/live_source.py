@@ -28,8 +28,12 @@ PAGE_SIZE = 4096
 MAX_DB_FILES = 128
 RETRY_SECONDS = 30
 CONFIG_SCAN_CHUNK = 8 * 1024 * 1024
-CONFIG_SCAN_PASS_BYTES = 2 * 1024 * 1024 * 1024
-CONFIG_SCAN_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+# A deeper Config.Cipher anchor needs more than the original 2 GiB pass budget: a WeChat
+# process past ~2 GB working set could never be read and the client stayed on "not ready"
+# (issue #30). The cost is in the bytes actually read, not in the limit, so a larger budget
+# is free whenever it is not needed.
+CONFIG_SCAN_PASS_BYTES = 4 * 1024 * 1024 * 1024
+CONFIG_SCAN_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
 CONFIG_SCAN_REGIONS = 65_536
 CONFIG_SCAN_CANDIDATES = 256
 CONFIG_SCAN_SECONDS = 90
