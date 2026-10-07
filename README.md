@@ -20,6 +20,7 @@
 | [#17](https://github.com/tswawa/WechatVibe/pull/17) | 消息内嵌图片直接显示（点击放大） | 开放；上游表示改动面较大、后续自己做，本 fork 保留该功能 |
 | [#22](https://github.com/tswawa/WechatVibe/pull/22) | 单条消息右键「重新生成测评」（只重算这一条并覆盖已保存结果） | 开放；本 fork 已并入 `main` |
 | [#23](https://github.com/tswawa/WechatVibe/pull/23) | 每条消息显示选项数 1 / 2 / 3：默认 1 与上游现状逐条一致，选 2 / 3 才列出概率最高的前 N 个候选（各带百分比，与第一名接近的标「相近」）；只影响本地模型路径，不改标签 schema。定位是**给用户放权**，同时算**前几个版本多候选显示的再重构** | 开放；本 fork 已并入 `main` |
+| [#31](https://github.com/tswawa/WechatVibe/pull/31) | 修 [#24](https://github.com/tswawa/WechatVibe/issues/24) 的崩溃类问题：进度记录与明细不一致时，尾巴证据的标签不再直接下标，改用 `setdefault` 兜底，整轮分析不会 KeyError 后永久失败；附 5 个复现用例（修复前 4/5 失败） | 开放；**修复分支可单独构建使用**（见下） |
 
 **#13 的采纳情况**（上游在 1.2.3 里手工移植）：
 
@@ -63,6 +64,17 @@
 只按功能重贴上面这些 fork 独占块；比对时用 `git diff -w` 过滤行尾噪声，最后跑 `tsc`、Node 与 Python 全套。
 v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github.com/silicon-sbt/WechatVibe/tree/selfuse/v1.2.0) 分支，仅作历史对照，不再维护。
 
+## 可以单独用的修复分支（基于上游 main，不含自用改动）
+
+这两个分支从 `origin/main`（上游）切出，各自只带一个提交、**没有夹带本 fork 的自用改动**，可以直接构建来救急；正式合并仍走上游 PR。
+
+| 分支 | 内容 | 上游状态 |
+| --- | --- | --- |
+| [`fix/state-tail-keyerror`](https://github.com/silicon-sbt/WechatVibe/tree/fix/state-tail-keyerror) | 修 [#24](https://github.com/tswawa/WechatVibe/issues/24) 的三处 `KeyError`（`batch_state.py` / `profile_state.py` / `result_store.py`）：进度被清、明细还在时不再整轮失败，健康状态数值逐字节不变 | [PR #31](https://github.com/tswawa/WechatVibe/pull/31) 开放 |
+| [`fix/key-scan-budget`](https://github.com/silicon-sbt/WechatVibe/tree/fix/key-scan-budget) | 修 [#30](https://github.com/tswawa/WechatVibe/issues/30)：config cipher 扫描预算从 2 GiB / 4 GiB 提到 4 GiB / 8 GiB，微信进程内存涨大后不再「账号永远未就绪」 | 未开 PR —— 留给 issue 作者提，避免撞车 |
+
+用法：`git clone -b <分支> https://github.com/silicon-sbt/WechatVibe.git`，然后按上游 README 构建。两个修复也都已经打在本机现役安装目录里验证过（bridge `result=ready required=5 matched=5`、`/api/health state=ready`）。
+
 ## 分支
 
 | 分支 | 内容 |
@@ -81,6 +93,8 @@ v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github
 | `feat/conversation-add-all` | PR #19（已合并，可归档） |
 | `feat/analysis-overview` | PR #20（已合并，可归档） |
 | `feat/background-sweep-ui` | PR #21（已合并，可归档） |
+| `fix/state-tail-keyerror` | PR #31（基于上游 main 的单提交，可单独构建） |
+| `fix/key-scan-budget` | #30 的扫描预算修复（基于上游 main 的单提交，未开 PR） |
 
 ## 许可
 
